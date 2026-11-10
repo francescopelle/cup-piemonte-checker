@@ -15,7 +15,7 @@ use crate::analisi::{self, Prenotazione, Slot};
 use crate::contatti::Contatti;
 use crate::errore::Errore;
 use crate::portale::{Modo, Sessione};
-use crate::zona::{perche_no, Calendario, Zona};
+use crate::zona::{perche_no, Calendario, Zona, NON_PRIMA, NON_SCEGLIBILE};
 
 pub const CALL_CENTER: &str = "800 000 500";
 
@@ -130,14 +130,39 @@ fn presa_visione_e_conferma(
     Ok(())
 }
 
+/// Quali date si possono spostare o prenotare.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Scelta {
+    /// Solo una data che va bene: nella zona, in un giorno si', dalla prima data utile e, per uno spostamento, prima
+    /// della prenotazione (vedi zona::perche_no). "Sposta qui" su una data buona e la prenotazione automatica.
+    #[default]
+    Buona,
+    /// Una qualsiasi delle date offerte dal portale, scelta dall'utente guardando tutte le date trovate e sapendo
+    /// perche' non va bene (piu' tardi della prenotazione, fuori zona...). Si controlla solo che si possa scegliere;
+    /// il Riepilogo deve tornare come sempre.
+    Qualsiasi,
+}
+
+impl Scelta {
+    /// La data, che non va bene per questo motivo, si puo' scegliere lo stesso? (`prova`: per provare il percorso
+    /// fino al Riepilogo va bene anche una data non prima della prenotazione.)
+    fn ammette(self, motivo: &str, prova: bool) -> bool {
+        match self {
+            Scelta::Buona => prova && motivo == NON_PRIMA,
+            Scelta::Qualsiasi => motivo != NON_SCEGLIBILE,
+        }
+    }
+}
+
 /// Una sessione nuova sul portale; con `Some(attesa)`, ogni risposta si aspetta al massimo tanto.
 pub type Nuova<'a> = &'a dyn Fn(Option<Duration>) -> Result<Sessione, Errore>;
 
 /// Sposta la prenotazione sulla data con questa chiave (vedi `Slot::chiave`). `tenuta` e' la sessione del controllo
 /// che ha trovato la data: tiene bloccata per noi la proposta, quindi si prova prima con lei; se manca o non va, si
-/// riparte con una sessione nuova (`nuova`), come il bot. La data deve andare ancora bene per zona e giorni rispetto
-/// alla prenotazione appena riletta dal portale. Con `prova` si ferma al Riepilogo (e accetta anche una data non
-/// prima della prenotazione, per provare il percorso). `fase` viene chiamata a ogni passo: se fallisce per
+/// riparte con una sessione nuova (`nuova`), come il bot. Con `Scelta::Buona` la data deve andare ancora bene per
+/// zona e giorni rispetto alla prenotazione appena riletta dal portale; con `Scelta::Qualsiasi` (l'utente l'ha scelta
+/// tra tutte le date trovate) basta che si possa scegliere. Con `prova` si ferma al Riepilogo (e accetta anche una
+/// data non prima della prenotazione, per provare il percorso). `fase` viene chiamata a ogni passo: se fallisce per
 /// `Fase::Conferma`, la Conferma non parte.
 #[allow(clippy::too_many_arguments)]
 pub fn sposta(
@@ -147,6 +172,7 @@ pub fn sposta(
     zona: &Zona,
     cal: &Calendario,
     prova: bool,
+    scelta: Scelta,
     attese: &Attese,
     contatti: &Contatti,
     fase: &mut dyn FnMut(Fase) -> Result<(), String>,
@@ -172,7 +198,7 @@ pub fn sposta(
             n => return Err(no(format!("La data scelta compare {n} volte: non scelgo a caso"))),
         };
         if let Some(motivo) = perche_no(&slot, Some(&att), zona, cal) {
-            if !(prova && motivo == "non è prima della prenotazione") {
+            if !scelta.ammette(motivo, prova) {
                 return Err(no(format!("La data scelta non va più bene ({motivo}): non sposto")));
             }
         }
@@ -299,7 +325,8 @@ fn ancora_da_prenotare(nuova: Nuova, attese: &Attese) -> Result<String, Errore> 
 /// sessione del controllo che ha trovato la data (`tenuta`, se e' di una prenotazione nuova della stessa ricetta),
 /// se no con una sessione nuova. Prima di tutto rilegge l'elenco: se nel frattempo la ricetta risulta prenotata,
 /// `GiaPrenotata`. Il Riepilogo deve avere la data, il luogo e tutte le prestazioni del carrello in un solo
-/// appuntamento; con piu' prestazioni si prenota solo la data proposta. Con `prova` si ferma al Riepilogo.
+/// appuntamento; con piu' prestazioni si prenota solo la data proposta. Le regole sulla data come per `sposta`
+/// (`scelta`). Con `prova` si ferma al Riepilogo.
 #[allow(clippy::too_many_arguments)]
 pub fn prenota(
     nuova: Nuova,
@@ -308,6 +335,7 @@ pub fn prenota(
     zona: &Zona,
     cal: &Calendario,
     prova: bool,
+    scelta: Scelta,
     attese: &Attese,
     contatti: &Contatti,
     fase: &mut dyn FnMut(Fase) -> Result<(), String>,
@@ -330,7 +358,9 @@ pub fn prenota(
             n => return Err(no(format!("La data scelta compare {n} volte: non scelgo a caso"))),
         };
         if let Some(motivo) = perche_no(&slot, None, zona, cal) {
-            return Err(no(format!("La data scelta non va più bene ({motivo}): non prenoto")));
+            if !scelta.ammette(motivo, false) {
+                return Err(no(format!("La data scelta non va più bene ({motivo}): non prenoto")));
+            }
         }
         if s.n_prestazioni() > 1 && !slot.proposta {
             return Err(no(SOLO_PROPOSTA)); // prima di "Seleziona", che bloccherebbe la data
@@ -554,6 +584,17 @@ mod test {
         prova: bool,
         salva: bool,
     ) -> (Result<Spostamento, Errore>, Vec<Fase>, Vec<crate::prova::Vista>) {
+        prova_sposta_scelta(risposte, tenuta, chiave, prova, salva, Scelta::Buona)
+    }
+
+    fn prova_sposta_scelta(
+        risposte: impl FnOnce(&str) -> Risposte,
+        tenuta: Option<&dyn Fn(&str) -> Sessione>,
+        chiave: &str,
+        prova: bool,
+        salva: bool,
+        scelta: Scelta,
+    ) -> (Result<Spostamento, Errore>, Vec<Fase>, Vec<crate::prova::Vista>) {
         let (base, h) = portale(risposte);
         let nuova = |_: Option<Duration>| Sessione::verso(&base, CF, NRE);
         let tenuta = tenuta.map(|t| t(&base));
@@ -565,6 +606,7 @@ mod test {
             &Zona::new(Dove::Tutte),
             &Calendario::default(),
             prova,
+            scelta,
             &attese(),
             &Contatti::default(),
             &mut |f| {
@@ -649,7 +691,8 @@ mod test {
         let nuova = |_: Option<Duration>| Sessione::verso(&base, CF, NRE);
         let mut fasi = vec![];
         let z = Zona::new(Dove::Tutte);
-        let esito = sposta(&nuova, None, CHIAVE, &z, &Calendario::default(), false, &attese(), contatti, &mut |f| {
+        let cal = Calendario::default();
+        let esito = sposta(&nuova, None, CHIAVE, &z, &cal, false, Scelta::Buona, &attese(), contatti, &mut |f| {
             fasi.push(f);
             Ok(())
         });
@@ -854,6 +897,35 @@ mod test {
     }
 
     #[test]
+    fn una_data_scelta_tra_tutte_si_sposta_anche_se_e_dopo_la_prenotazione() {
+        // la prenotazione e' il 2 novembre, la data scelta il 1 dicembre: con le regole solite no (vedi sopra), scelta
+        // dall'utente tra tutte le date trovate si', con il Riepilogo e la verifica di sempre
+        let (esito, fasi, viste) = prova_sposta_scelta(
+            |b| {
+                let mut r = lista(b, &prenotata("Lunedì 2 Novembre 2026", "MOLINETTE"));
+                r.extend(fino_alle_date(b, &prenotata("Lunedì 2 Novembre 2026", "MOLINETTE")));
+                r.extend([ok("selezionata"), riep(b, "SAN GIOVANNI BOSCO", &["VISITA"], false), ok("confermata")]);
+                r.extend(lista(b, &prenotata(NUOVA, "SAN GIOVANNI BOSCO")));
+                r
+            },
+            None,
+            CHIAVE,
+            false,
+            true,
+            Scelta::Qualsiasi,
+        );
+        let s = esito.unwrap();
+        assert!(s.fatto && s.dopo.chiave() == CHIAVE);
+        assert_eq!(fasi, [Fase::Riepilogo, Fase::Conferma, Fase::Verifica]);
+        assert_eq!(viste.len(), 13);
+        // una data senza "Seleziona" non si sceglie mai; ogni altro motivo si', se l'ha scelta l'utente
+        assert!(!Scelta::Qualsiasi.ammette(NON_SCEGLIBILE, false));
+        assert!(Scelta::Qualsiasi.ammette("fuori zona", false) && Scelta::Qualsiasi.ammette(NON_PRIMA, false));
+        assert!(!Scelta::Buona.ammette("fuori zona", true) && !Scelta::Buona.ammette(NON_PRIMA, false));
+        assert!(Scelta::Buona.ammette(NON_PRIMA, true)); // la prova del percorso
+    }
+
+    #[test]
     fn prestazioni_prenotate_insieme_si_spostano_tutte_o_niente() {
         let due =
             [("PRENOTATO", PRIMA, "MOLINETTE", "AMB", "VISITA A"), ("PRENOTATO", PRIMA, "MOLINETTE", "AMB", "ESAME B")];
@@ -919,11 +991,9 @@ mod test {
         let z = Zona::new(Dove::Tutte);
         // la prima verifica dopo che il finto portale ha smesso di aspettare la Conferma (1,5 s)
         let attese = Attese { pause: vec![Duration::from_secs(1)], ..attese() };
+        let (cal, contatti) = (Calendario::default(), Contatti::default());
         let s =
-            sposta(&nuova, None, CHIAVE, &z, &Calendario::default(), false, &attese, &Contatti::default(), &mut |_| {
-                Ok(())
-            })
-            .unwrap();
+            sposta(&nuova, None, CHIAVE, &z, &cal, false, Scelta::Buona, &attese, &contatti, &mut |_| Ok(())).unwrap();
         assert!(s.fatto);
         assert_eq!(h.join().unwrap().len(), 13); // senza note: niente presa visione
                                                  // dopo la Conferma il portale mostra sempre la data vecchia: esito incerto, mai "non spostata"
@@ -982,6 +1052,7 @@ mod test {
             &z,
             &Calendario::default(),
             false,
+            Scelta::Buona,
             &attese(),
             &Contatti::default(),
             &mut |_| Ok(()),
@@ -1032,25 +1103,27 @@ mod test {
         chiave: &str,
         prova: bool,
     ) -> (Result<Prenotata, Errore>, Vec<Fase>, Vec<crate::prova::Vista>) {
+        prova_prenota_con(risposte, tenuta, chiave, prova, &Calendario::default(), Scelta::Buona)
+    }
+
+    fn prova_prenota_con(
+        risposte: impl FnOnce(&str) -> Risposte,
+        tenuta: Option<&dyn Fn(&str) -> Sessione>,
+        chiave: &str,
+        prova: bool,
+        cal: &Calendario,
+        scelta: Scelta,
+    ) -> (Result<Prenotata, Errore>, Vec<Fase>, Vec<crate::prova::Vista>) {
         let (base, h) = portale(risposte);
         let nuova = |_: Option<Duration>| Sessione::verso(&base, CF, NRE);
         let tenuta = tenuta.map(|t| t(&base));
         let mut fasi = vec![];
         let z = Zona::new(Dove::Tutte);
-        let esito = prenota(
-            &nuova,
-            tenuta,
-            chiave,
-            &z,
-            &Calendario::default(),
-            prova,
-            &attese(),
-            &Contatti::default(),
-            &mut |f| {
+        let esito =
+            prenota(&nuova, tenuta, chiave, &z, cal, prova, scelta, &attese(), &Contatti::default(), &mut |f| {
                 fasi.push(f);
                 Ok(())
-            },
-        );
+            });
         (esito, fasi, h.join().unwrap())
     }
 
@@ -1082,6 +1155,37 @@ mod test {
             Some(format!("{RIEPILOGO}:riepilogo-nextButton-bottom"))
         );
         assert_eq!(viste[15].0, "GET /web/guest/lista-prenotazioni HTTP/1.1");
+    }
+
+    #[test]
+    fn una_data_scelta_tra_tutte_si_prenota_anche_prima_della_prima_data_utile() {
+        // la data libera e' il 6 settembre 2027, la prima data utile il 7
+        let dal = Calendario { dal: chrono::NaiveDate::from_ymd_opt(2027, 9, 7), ..Default::default() };
+        let fino_alle_date = |b: &str| {
+            let mut r = nessuna(b);
+            r.extend(nessuna(b));
+            r.extend(date_nuove(b, &[ECO]));
+            r
+        };
+        // con le regole solite non si sceglie (niente "Seleziona")
+        let (esito, fasi, viste) = prova_prenota_con(fino_alle_date, None, LIBERA, false, &dal, Scelta::Buona);
+        assert!(matches!(&esito, Err(Errore::Inattesa(m)) if m.contains("prima della prima data utile")), "{esito:?}");
+        assert!(fasi == [Fase::Riepilogo] && viste.len() == 11);
+        // scelta dall'utente tra tutte le date trovate: si prenota, con il Riepilogo e la verifica di sempre
+        let (esito, _, viste) = prova_prenota_con(
+            |b| {
+                let mut r = fino_alle_date(b);
+                r.extend([ok("selezionata"), riep_nuova(b, &[ECO], true), presa_visione_ok(), ok("confermata")]);
+                r.extend(lista(b, &[("PRENOTATO", GIORNO, "OSPEDALE", "ECO 2", ECO)]));
+                r
+            },
+            None,
+            LIBERA,
+            false,
+            &dal,
+            Scelta::Qualsiasi,
+        );
+        assert!(esito.unwrap().fatto && viste.len() == 17);
     }
 
     #[test]
@@ -1305,6 +1409,7 @@ mod test {
             &z,
             &Calendario::default(),
             true,
+            Scelta::Buona,
             &attese(),
             &Contatti::default(),
             &mut |_| Ok(()),

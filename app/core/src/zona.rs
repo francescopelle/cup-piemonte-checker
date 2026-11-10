@@ -240,6 +240,11 @@ impl Calendario {
     }
 }
 
+/// Perche' non va bene una data senza "Seleziona" (e che non e' la proposta): non la si puo' scegliere sul portale.
+pub const NON_SCEGLIBILE: &str = "non si può scegliere";
+/// Perche' non va bene una data non prima della prenotazione: l'unico motivo che dipende dalla prenotazione di adesso.
+pub const NON_PRIMA: &str = "non è prima della prenotazione";
+
 /// Perche' una data non va bene, o None se va bene. La regola unica delle date da proporre: prenotabile, nella
 /// zona, in un giorno si' e prima della prenotazione. Se la prenotazione e' in un giorno no va bene anche una data
 /// piu' tardi (dopo lo spostamento e' in un giorno si': niente spostamenti a catena). Vale anche per una prenotazione
@@ -247,7 +252,7 @@ impl Calendario {
 /// va bene.
 pub fn perche_no(slot: &Slot, attuale: Option<&Prenotazione>, zona: &Zona, cal: &Calendario) -> Option<&'static str> {
     if !(slot.proposta || slot.seleziona.is_some()) {
-        return Some("non si può scegliere");
+        return Some(NON_SCEGLIBILE);
     }
     if !zona.ammette(slot, attuale) {
         return Some("fuori zona");
@@ -259,7 +264,7 @@ pub fn perche_no(slot: &Slot, attuale: Option<&Prenotazione>, zona: &Zona, cal: 
         return Some("giorno da evitare");
     }
     let dopo = attuale.is_some_and(|a| slot.quando >= a.quando && cal.giorno_si(a.quando.date()));
-    dopo.then_some("non è prima della prenotazione")
+    dopo.then_some(NON_PRIMA)
 }
 
 pub fn candidata(slot: &Slot, attuale: Option<&Prenotazione>, zona: &Zona, cal: &Calendario) -> bool {

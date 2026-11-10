@@ -7,10 +7,10 @@ use std::cell::Cell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use chrono::NaiveDateTime;
-use cup_core::operazioni::{Fase, Prenotata, Spostamento, CALL_CENTER};
+use cup_core::operazioni::{Fase, Prenotata, Scelta, Spostamento, CALL_CENTER};
 use cup_core::{contatti, Errore, Sessione};
 
-use crate::archivio::{Dati, Operazione, Ricetta, Visita, ISO};
+use crate::archivio::{Data, Dati, Operazione, Ricetta, Visita, ISO};
 use crate::controlli::{adesso, blocca, impostazioni, tipo, Attivita, Notifica, Stato, TENUTA};
 use crate::segnalazioni;
 
@@ -168,6 +168,7 @@ fn fallita(stato: &Stato, d: &mut Dati, r: &Ricetta, cosa: &str, descrizione: &s
                     x.automatica = false;
                     if let Some(es) = x.esito.as_mut() {
                         es.buone.clear();
+                        es.tutte.clear();
                         es.nota =
                             Some(format!("{e}: al prossimo controllo l'app legge la prenotazione e cerca date prima."));
                     }
@@ -232,6 +233,7 @@ fn a_vuoto(e: &Errore) -> bool {
 fn dopo_incerta(r: &mut Ricetta) {
     if let Some(e) = r.esito.as_mut() {
         e.buone.clear();
+        e.tutte.clear();
         e.nota =
             Some("Dopo aver controllato sul sito del CUP, riprendi i controlli: l'app rilegge la prenotazione.".into());
     }
@@ -298,11 +300,45 @@ fn maiuscola(s: &str) -> String {
     c.next().map_or(String::new(), |p| p.to_uppercase().chain(c).collect())
 }
 
-/// Il motore di uno spostamento: la ricetta, la sessione del controllo (se valida), le fasi.
-pub type MotoreSposta<'a> = &'a dyn Fn(&Ricetta, Option<Sessione>, Fasi) -> Result<Spostamento, Errore>;
+/// Il motore di uno spostamento: la ricetta, la sessione del controllo (se valida), le regole sulla data, le fasi.
+pub type MotoreSposta<'a> = &'a dyn Fn(&Ricetta, Option<Sessione>, Scelta, Fasi) -> Result<Spostamento, Errore>;
 
-/// Sposta la ricetta sulla data con questa chiave, che deve essere tra le date buone dell'ultimo controllo. `inizio`
-/// si chiama quando l'operazione parte (per mostrarla nell'interfaccia).
+/// Quando l'utente sceglie una data che non va bene (dopo la prenotazione, fuori zona...), la prenotazione
+/// automatica si spegne: se no, al controllo dopo la sposterebbe su una data che va bene, contro la sua scelta.
+const SPENTA_PER_SCELTA: &str = " La prenotazione automatica è spenta, se no la sposterebbe di nuovo: riaccendila \
+                                 da «Modifica» se vuoi.";
+
+/// La data scelta tra quelle trovate dall'ultimo controllo e con quali regole va ricontrollata: `Scelta::Buona` se va
+/// bene adesso, `Scelta::Qualsiasi` se l'utente l'ha scelta tra tutte le date trovate pur sapendo che non va bene.
+/// La prenotazione automatica sceglie solo tra le date buone.
+fn da_scegliere(r: &Ricetta, chiave: &str, da_sola: bool) -> Result<(Data, Scelta), String> {
+    let non_trovata = || "Questa data non è più tra quelle trovate: aspetta il prossimo controllo.".to_string();
+    let e = r.esito.as_ref().ok_or_else(non_trovata)?;
+    if da_sola {
+        return e.buone.iter().find(|d| d.chiave == chiave).map(|d| (d.clone(), Scelta::Buona)).ok_or_else(non_trovata);
+    }
+    let d = e.trovata(chiave).ok_or_else(non_trovata)?;
+    if !d.sceglibile {
+        return Err(match &d.perche {
+            Some(p) => format!("Questa data non si può scegliere sul portale ({p})."),
+            None => "Questa data non si può scegliere sul portale.".into(),
+        });
+    }
+    Ok((d.clone(), if e.perche(d).is_none() { Scelta::Buona } else { Scelta::Qualsiasi }))
+}
+
+/// Nel registro: una data scelta tra tutte, che non va bene.
+fn tra_tutte(regola: Scelta) -> &'static str {
+    if regola == Scelta::Qualsiasi {
+        " (scelta tra tutte le date)"
+    } else {
+        ""
+    }
+}
+
+/// Sposta la ricetta sulla data con questa chiave, che deve essere tra le date trovate dall'ultimo controllo: una buona
+/// o, se l'ha scelta l'utente, una qualsiasi delle altre. `inizio` si chiama quando l'operazione parte (per mostrarla
+/// nell'interfaccia).
 pub fn sposta(stato: &Stato, id: u64, chiave: &str, motore: MotoreSposta, inizio: &dyn Fn()) -> Result<Fine, String> {
     sposta_come(stato, id, chiave, motore, inizio, false)
 }
@@ -353,14 +389,11 @@ fn sposta_come(
         if r.nuova {
             return Err("Questa ricetta non è ancora prenotata: usa «Prenota qui».".into());
         }
-        scelta = r.esito.as_ref().and_then(|e| e.buone.iter().find(|d| d.chiave == chiave)).cloned();
-        scelta
-            .as_ref()
-            .map(|_| ())
-            .ok_or("Questa data non è più tra quelle trovate: aspetta il prossimo controllo.".into())
+        scelta = Some(da_scegliere(r, chiave, da_sola)?);
+        Ok(())
     })?;
     let _occupata = Occupata(stato, id);
-    let scelta = scelta.expect("controllata da prendi");
+    let (scelta, regola) = scelta.expect("controllata da prendi");
     inizio();
     // la sessione del controllo tiene la proposta: si prende (non si copia), se e' recente e della stessa ricetta
     let tenuta = blocca(&stato.tenute)
@@ -368,15 +401,16 @@ fn sposta_come(
         .filter(|t| adesso() - t.ts < TENUTA && t.impostazioni == impostazioni(&r))
         .map(|t| t.sessione);
     stato.registro.scrivi(&format!(
-        "ricetta {id}: spostamento{}{}",
+        "ricetta {id}: spostamento{}{}{}",
         come(da_sola),
+        tra_tutte(regola),
         if tenuta.is_some() { " (con la sessione del controllo)" } else { "" }
     ));
     contatti_nel_registro(stato, &r);
     let descrizione = format!("al {} · {}", scelta.quando, scelta.luogo);
     let scritti = Cell::new(Scritti::default());
     let esito = catch_unwind(AssertUnwindSafe(|| {
-        motore(&r, tenuta, &mut |f| {
+        motore(&r, tenuta, regola, &mut |f| {
             let mut s = scritti.get();
             s.segna(f);
             scritti.set(s);
@@ -389,25 +423,30 @@ fn sposta_come(
         let fine = match esito {
             Ok(s) if s.fatto => {
                 let dopo = Visita::spostata(&s.dopo, &s.prima.cosa);
+                let mut spenta = "";
                 if let Ok(x) = d.ricetta(id) {
                     x.operazione = None;
                     // "Sposta" e' stato aperto adesso: i 20 minuti ripartono da qui
                     x.ultimo_tentativo = Some(adesso());
                     x.tentate.clear(); // da ora contano le date prima di quella nuova
+                    if regola == Scelta::Qualsiasi && x.automatica {
+                        x.automatica = false;
+                        spenta = SPENTA_PER_SCELTA;
+                    }
+                    let nota = format!("Prenotazione spostata dall'app{}.", come(da_sola));
+                    dopo_fatta(x, dopo.clone(), chiave, nota);
                     let e = x.esito.get_or_insert_with(Default::default);
-                    e.ts = adesso();
-                    e.attuale = Some(dopo.clone());
-                    e.buone.clear();
-                    e.errore = None;
-                    e.nota = Some(format!("Prenotazione spostata dall'app{}.", come(da_sola)));
                     e.note_visita = s.note.clone();
                 }
                 stato.registro.scrivi(&format!("ricetta {id}: spostamento fatto"));
+                if !spenta.is_empty() {
+                    stato.registro.scrivi(&format!("ricetta {id}: prenotazione automatica spenta"));
+                }
                 let note = if s.note.is_empty() { "" } else { "\nNell'app trovi le note per la visita." };
                 let conferma = dove_la_conferma(&r, scritti.get());
                 Fine {
                     ok: true,
-                    messaggio: format!("Prenotazione spostata: {} · {}{conferma}", dopo.quando, dopo.luogo),
+                    messaggio: format!("Prenotazione spostata: {} · {}{conferma}{spenta}", dopo.quando, dopo.luogo),
                     notifica: Some(Notifica {
                         ricetta: id,
                         tipo: "spostata",
@@ -427,11 +466,25 @@ fn sposta_come(
     Ok(fine)
 }
 
-/// Il motore di una prima prenotazione: la ricetta, la sessione del controllo (se valida), le fasi.
-pub type MotorePrenota<'a> = &'a dyn Fn(&Ricetta, Option<Sessione>, Fasi) -> Result<Prenotata, Errore>;
+/// Dopo uno spostamento o una prenotazione riusciti: la prenotazione nuova e, delle date trovate dall'ultimo
+/// controllo, tutte tranne quella presa, per sostituirla con un'altra senza aspettare il controllo dopo. Le buone si
+/// svuotano: erano buone rispetto alla prenotazione di prima (vedi `Esito::perche`).
+fn dopo_fatta(x: &mut Ricetta, dopo: Visita, presa: &str, nota: String) {
+    let e = x.esito.get_or_insert_with(Default::default);
+    e.ts = adesso();
+    e.attuale = Some(dopo);
+    e.buone.clear();
+    e.tutte.retain(|d| d.chiave != presa);
+    e.errore = None;
+    e.nota = Some(nota);
+}
 
-/// Prenota una ricetta mai prenotata sulla data con questa chiave, che deve essere tra le date buone dell'ultimo
-/// controllo. Come `sposta`: lo stato salvato prima della Conferma, un esito incerto ferma la ricetta.
+/// Il motore di una prima prenotazione: la ricetta, la sessione del controllo (se valida), le regole sulla data, le
+/// fasi.
+pub type MotorePrenota<'a> = &'a dyn Fn(&Ricetta, Option<Sessione>, Scelta, Fasi) -> Result<Prenotata, Errore>;
+
+/// Prenota una ricetta mai prenotata sulla data con questa chiave, che deve essere tra le date trovate dall'ultimo
+/// controllo (una buona o, se l'ha scelta l'utente, una qualsiasi delle altre). Come `sposta`: lo stato salvato prima della Conferma, un esito incerto ferma la ricetta.
 pub fn prenota(stato: &Stato, id: u64, chiave: &str, motore: MotorePrenota, inizio: &dyn Fn()) -> Result<Fine, String> {
     prenota_come(stato, id, chiave, motore, inizio, false)
 }
@@ -455,29 +508,27 @@ fn prenota_come(
         if !r.nuova {
             return Err("Questa ricetta risulta già prenotata: l'app cerca date prima, con \"Sposta qui\".".into());
         }
-        scelta = r.esito.as_ref().and_then(|e| e.buone.iter().find(|d| d.chiave == chiave)).cloned();
-        scelta
-            .as_ref()
-            .map(|_| ())
-            .ok_or("Questa data non è più tra quelle trovate: aspetta il prossimo controllo.".into())
+        scelta = Some(da_scegliere(r, chiave, da_sola)?);
+        Ok(())
     })?;
     let _occupata = Occupata(stato, id);
-    let scelta = scelta.expect("controllata da prendi");
+    let (scelta, regola) = scelta.expect("controllata da prendi");
     inizio();
     let tenuta = blocca(&stato.tenute)
         .remove(&id)
         .filter(|t| adesso() - t.ts < TENUTA && t.impostazioni == impostazioni(&r))
         .map(|t| t.sessione);
     stato.registro.scrivi(&format!(
-        "ricetta {id}: prenotazione{}{}",
+        "ricetta {id}: prenotazione{}{}{}",
         come(da_sola),
+        tra_tutte(regola),
         if tenuta.is_some() { " (con la sessione del controllo)" } else { "" }
     ));
     contatti_nel_registro(stato, &r);
     let descrizione = format!("al {} · {}", scelta.quando, scelta.luogo);
     let scritti = Cell::new(Scritti::default());
     let esito = catch_unwind(AssertUnwindSafe(|| {
-        motore(&r, tenuta, &mut |f| {
+        motore(&r, tenuta, regola, &mut |f| {
             let mut s = scritti.get();
             s.segna(f);
             scritti.set(s);
@@ -490,6 +541,7 @@ fn prenota_come(
         let fine = match esito {
             Ok(p) if p.fatto => {
                 let dopo = Visita::spostata(&p.dopo, &p.prestazioni.join(" + "));
+                let mut spenta = "";
                 if let Ok(x) = d.ricetta(id) {
                     x.operazione = None;
                     // da ora e' una ricetta prenotata: i controlli cercano date prima, con "Sposta"
@@ -498,22 +550,31 @@ fn prenota_come(
                     x.ultimo_tentativo = Some(adesso());
                     x.notificate.clear();
                     x.tentate.clear();
+                    if regola == Scelta::Qualsiasi && x.automatica {
+                        x.automatica = false;
+                        spenta = SPENTA_PER_SCELTA;
+                    }
+                    let nota = format!("Prenotazione fatta dall'app{}. Da ora cerca date prima.", come(da_sola));
+                    dopo_fatta(x, dopo.clone(), chiave, nota);
                     let e = x.esito.get_or_insert_with(Default::default);
-                    e.ts = adesso();
-                    e.attuale = Some(dopo.clone());
-                    e.buone.clear();
-                    e.errore = None;
-                    e.zona.clear(); // "della prenotazione" adesso ha un senso: si rilegge al prossimo controllo
+                    // "della prenotazione" adesso ha un senso: si rilegge al prossimo controllo
+                    e.zona.clear();
+                    // con piu' prestazioni le altre date non erano per tutte insieme: non si scelgono nemmeno dopo
+                    if e.solo_proposta {
+                        e.tutte.clear();
+                    }
                     e.solo_proposta = false;
-                    e.nota = Some(format!("Prenotazione fatta dall'app{}. Da ora cerca date prima.", come(da_sola)));
                     e.note_visita = p.note.clone();
                 }
                 stato.registro.scrivi(&format!("ricetta {id}: prenotazione fatta"));
+                if !spenta.is_empty() {
+                    stato.registro.scrivi(&format!("ricetta {id}: prenotazione automatica spenta"));
+                }
                 let note = if p.note.is_empty() { "" } else { "\nNell'app trovi le note per la visita." };
                 let conferma = dove_la_conferma(&r, scritti.get());
                 Fine {
                     ok: true,
-                    messaggio: format!("Prenotazione fatta: {} · {}{conferma}", dopo.quando, dopo.luogo),
+                    messaggio: format!("Prenotazione fatta: {} · {}{conferma}{spenta}", dopo.quando, dopo.luogo),
                     notifica: Some(Notifica {
                         ricetta: id,
                         tipo: "prenotata",
@@ -570,6 +631,7 @@ pub fn disdici(stato: &Stato, id: u64, motore: MotoreDisdici, inizio: &dyn Fn())
                     e.ts = adesso();
                     e.attuale = None;
                     e.buone.clear();
+                    e.tutte.clear(); // erano date per spostarla
                     e.errore = None;
                     e.note_visita.clear();
                     e.nota = Some(format!("Prenotazione {descrizione} disdetta dall'app."));
@@ -681,6 +743,8 @@ mod test {
                     luogo: "SAN GIOVANNI BOSCO, AMB, TORINO (TO)".into(),
                     proposta: false,
                     comune: "TORINO".into(),
+                    perche: None,
+                    sceglibile: true,
                 }],
                 date: 1,
                 ..Default::default()
@@ -732,11 +796,82 @@ mod test {
         }
     }
 
+    /// Una data trovata dall'ultimo controllo, con il suo perche'.
+    fn trovata(chiave: &str, quando: &str, perche: Option<&str>, sceglibile: bool) -> Data {
+        Data {
+            chiave: chiave.into(),
+            quando: quando.into(),
+            luogo: "OSPEDALE, AMB, TORINO (TO)".into(),
+            proposta: false,
+            comune: "TORINO".into(),
+            perche: perche.map(String::from),
+            sceglibile,
+        }
+    }
+
+    #[test]
+    fn sostituire_la_prenotazione_con_una_qualsiasi_delle_date_trovate() {
+        let (s, c) = stato("tutte");
+        // l'ultimo controllo: la data buona (1 dicembre) e altre tre, dopo la prenotazione del 7 gennaio, fuori zona e
+        // senza "Seleziona"
+        let buona = s.dati().ricette[0].esito.as_ref().unwrap().buone[0].clone();
+        let dopo = trovata("202701200900|CTOAMB", "mer 20/01/2027 ore 09:00", None, true);
+        let fuori = trovata("202612020900|ASTIAMB", "mer 02/12/2026 ore 09:00", Some("fuori zona"), true);
+        let bloccata = trovata("202612030900|XAMB", "gio 03/12/2026 ore 09:00", Some("non si può scegliere"), false);
+        {
+            let mut d = s.dati();
+            let r = &mut d.ricette[0];
+            r.automatica = true;
+            r.esito.as_mut().unwrap().tutte = vec![buona.clone(), fuori.clone(), bloccata.clone(), dopo.clone()];
+        }
+        let regole = std::cell::RefCell::new(vec![]);
+        let motore = |_: &Ricetta, _: Option<Sessione>, scelta: Scelta, fase: Fasi| {
+            regole.borrow_mut().push(scelta);
+            fase(Fase::Conferma).unwrap();
+            let n = regole.borrow().len();
+            let (quando, sede) =
+                if n == 1 { (quando(20, 1, 2027), "CTO") } else { (quando(1, 12, 2026), "SAN GIOVANNI BOSCO") };
+            Ok(Spostamento {
+                prima: prima(),
+                dopo: Slot { quando, luogo: luogo(sede), seleziona: None, proposta: false },
+                note: vec![],
+                fatto: true,
+            })
+        };
+        // la prenotazione automatica sceglie solo tra le date buone; una data senza "Seleziona" non si sceglie mai
+        assert!(sposta_da_sola(&s, 1, &dopo.chiave, &motore).unwrap_err().contains("non è più tra quelle trovate"));
+        assert!(sposta(&s, 1, &bloccata.chiave, &motore, &|| {}).unwrap_err().contains("non si può scegliere"));
+        assert!(regole.borrow().is_empty());
+        // una data dopo la prenotazione, scelta dall'utente: il motore la ricontrolla solo per quello che serve, e
+        // l'automatica si spegne (se no la riporterebbe su una data prima)
+        let f = sposta(&s, 1, &dopo.chiave, &motore, &|| {}).unwrap();
+        assert!(f.ok && f.messaggio.contains("La prenotazione automatica è spenta"), "{}", f.messaggio);
+        assert_eq!(*regole.borrow(), [Scelta::Qualsiasi]);
+        let r = s.archivio.leggi().unwrap().ricette[0].clone();
+        let e = r.esito.as_ref().unwrap();
+        assert!(!r.automatica && e.buone.is_empty());
+        assert_eq!(e.attuale.as_ref().unwrap().iso, "2027-01-20T09:00");
+        // a posteriori: le altre date restano, tranne quella presa, e si puo' tornare su una di loro
+        assert_eq!(e.tutte, [buona.clone(), fuori.clone(), bloccata.clone()]);
+        assert_eq!(e.perche(&buona), None); // adesso il 1 dicembre e' prima della prenotazione
+        let f = sposta(&s, 1, &buona.chiave, &motore, &|| {}).unwrap();
+        assert!(f.ok && !f.messaggio.contains("automatica"));
+        assert_eq!(*regole.borrow(), [Scelta::Qualsiasi, Scelta::Buona]);
+        let e = s.archivio.leggi().unwrap().ricette[0].esito.clone().unwrap();
+        assert_eq!(e.tutte, [fuori.clone(), bloccata]);
+        // e una fuori zona, sempre con le regole della scelta dell'utente
+        sposta(&s, 1, &fuori.chiave, &motore, &|| {}).unwrap();
+        assert_eq!(regole.borrow()[2], Scelta::Qualsiasi);
+        registro_pulito(&s);
+        assert!(s.registro.ultime(50).iter().any(|r| r.ends_with("spostamento (scelta tra tutte le date)")));
+        std::fs::remove_dir_all(&c).unwrap();
+    }
+
     #[test]
     fn spostamento_con_lo_stato_salvato_prima_della_conferma() {
         let (s, c) = stato("sposta");
         let iniziato = Cell::new(false);
-        let motore = |r: &Ricetta, tenuta: Option<Sessione>, fase: Fasi| {
+        let motore = |r: &Ricetta, tenuta: Option<Sessione>, _: Scelta, fase: Fasi| {
             assert!(tenuta.is_none() && r.id == 1);
             assert!(s.in_corso().get(&1) == Some(&Attivita::Spostamento));
             fase(Fase::Riepilogo).unwrap();
@@ -780,10 +915,11 @@ mod test {
             drop(d);
             (s, c)
         };
-        let mai = |_: &Ricetta, _: Option<Sessione>, _: Fasi| -> Result<Spostamento, Errore> { panic!("no") };
+        let mai =
+            |_: &Ricetta, _: Option<Sessione>, _: Scelta, _: Fasi| -> Result<Spostamento, Errore> { panic!("no") };
         // riuscita: la notifica dice che l'ha fatto l'app, e le date tentate ricominciano dalla data nuova
         let (s, c) = accesa("auto-ok");
-        let ok = |_: &Ricetta, _: Option<Sessione>, _: Fasi| Ok(spostata(vec![]));
+        let ok = |_: &Ricetta, _: Option<Sessione>, _: Scelta, _: Fasi| Ok(spostata(vec![]));
         let f = sposta_da_sola(&s, 1, CHIAVE, &ok).unwrap();
         assert!(f.ok);
         let n = f.notifica.unwrap();
@@ -805,7 +941,7 @@ mod test {
         std::fs::remove_dir_all(&c).unwrap();
         // una pagina che il motore non conosce: niente confermato, automatica spenta e una notifica
         let (s, c) = accesa("auto-inattesa");
-        let strana = |_: &Ricetta, _: Option<Sessione>, _: Fasi| -> Result<Spostamento, Errore> {
+        let strana = |_: &Ricetta, _: Option<Sessione>, _: Scelta, _: Fasi| -> Result<Spostamento, Errore> {
             Err(Errore::Inattesa("Pagina del portale non riconosciuta: sezioni [Nuova], moduli [], pulsanti []".into()))
         };
         let f = sposta_da_sola(&s, 1, CHIAVE, &strana).unwrap();
@@ -828,8 +964,9 @@ mod test {
         ] {
             let (s, c) = accesa(nome);
             let e = Cell::new(Some(e));
-            let no =
-                |_: &Ricetta, _: Option<Sessione>, _: Fasi| -> Result<Spostamento, Errore> { Err(e.take().unwrap()) };
+            let no = |_: &Ricetta, _: Option<Sessione>, _: Scelta, _: Fasi| -> Result<Spostamento, Errore> {
+                Err(e.take().unwrap())
+            };
             let f = sposta_da_sola(&s, 1, CHIAVE, &no).unwrap();
             let n = f.notifica.unwrap();
             assert!(!f.ok && s.dati().ricette[0].automatica, "{nome}");
@@ -838,7 +975,7 @@ mod test {
         }
         // esito incerto: ricetta ferma e automatica spenta, anche se l'operazione l'aveva chiesta l'utente
         let (s, c) = accesa("auto-incerta");
-        let incerto = |_: &Ricetta, _: Option<Sessione>, fase: Fasi| -> Result<Spostamento, Errore> {
+        let incerto = |_: &Ricetta, _: Option<Sessione>, _: Scelta, fase: Fasi| -> Result<Spostamento, Errore> {
             fase(Fase::Conferma).unwrap();
             Err(Errore::Incerto("verifica non riuscita".into()))
         };
@@ -860,7 +997,7 @@ mod test {
             (s, c)
         };
         let (s, c) = con_contatti("contatti");
-        let motore = |r: &Ricetta, _: Option<Sessione>, fase: Fasi| {
+        let motore = |r: &Ricetta, _: Option<Sessione>, _: Scelta, fase: Fasi| {
             assert_eq!(r.contatti().cellulare.as_deref(), Some("3471234567"));
             fase(Fase::Contatti { email: true, cellulare: true }).unwrap();
             fase(Fase::Conferma).unwrap();
@@ -873,7 +1010,7 @@ mod test {
         // il portale li rifiuta: si conferma senza, e il messaggio lo dice
         let (s2, c2) = con_contatti("contatti-rifiutati");
         // solo l'email ha un campo nel Riepilogo: il messaggio parla solo dell'email
-        let rifiutati = |_: &Ricetta, _: Option<Sessione>, fase: Fasi| {
+        let rifiutati = |_: &Ricetta, _: Option<Sessione>, _: Scelta, fase: Fasi| {
             fase(Fase::Contatti { email: true, cellulare: false }).unwrap();
             fase(Fase::Conferma).unwrap();
             fase(Fase::SenzaContatti).unwrap();
@@ -901,8 +1038,8 @@ mod test {
         }
     }
 
-    fn motore_senza() -> impl Fn(&Ricetta, Option<Sessione>, Fasi) -> Result<Spostamento, Errore> {
-        |_, _, fase| {
+    fn motore_senza() -> impl Fn(&Ricetta, Option<Sessione>, Scelta, Fasi) -> Result<Spostamento, Errore> {
+        |_, _, _, fase| {
             fase(Fase::Conferma).unwrap();
             Ok(spostata(vec![]))
         }
@@ -911,8 +1048,9 @@ mod test {
     #[test]
     fn niente_spostamento_su_date_non_trovate_o_durante_un_controllo() {
         let (s, c) = stato("rifiuti");
-        let mai =
-            |_: &Ricetta, _: Option<Sessione>, _: Fasi| -> Result<Spostamento, Errore> { panic!("non deve partire") };
+        let mai = |_: &Ricetta, _: Option<Sessione>, _: Scelta, _: Fasi| -> Result<Spostamento, Errore> {
+            panic!("non deve partire")
+        };
         assert!(sposta(&s, 1, "202612020900|ALTRO", &mai, &|| {}).unwrap_err().contains("non è più tra quelle"));
         blocca(&s.in_corso).insert(1, Attivita::Controllo);
         assert!(sposta(&s, 1, CHIAVE, &mai, &|| {}).unwrap_err().contains("controllo in corso"));
@@ -935,7 +1073,7 @@ mod test {
             blocca(&s.tenute).insert(1, Tenuta { sessione, ts, impostazioni: imp });
         };
         let ricevuta = Cell::new(None);
-        let motore = |_: &Ricetta, t: Option<Sessione>, _: Fasi| {
+        let motore = |_: &Ricetta, t: Option<Sessione>, _: Scelta, _: Fasi| {
             ricevuta.set(Some(t.is_some()));
             Err(Errore::Inattesa("La data scelta non è più disponibile".into()))
         };
@@ -967,7 +1105,7 @@ mod test {
     #[test]
     fn esito_incerto_ferma_la_ricetta_e_le_altre_operazioni() {
         let (s, c) = stato("incerto");
-        let motore = |_: &Ricetta, _: Option<Sessione>, fase: Fasi| -> Result<Spostamento, Errore> {
+        let motore = |_: &Ricetta, _: Option<Sessione>, _: Scelta, fase: Fasi| -> Result<Spostamento, Errore> {
             fase(Fase::Conferma).unwrap();
             fase(Fase::Verifica).unwrap();
             Err(Errore::Incerto("Conferma inviata, esito incerto: la prenotazione risulta non verificabile.".into()))
@@ -979,7 +1117,8 @@ mod test {
         let d = s.archivio.leggi().unwrap();
         assert!(d.ricette[0].incerta.is_some() && !d.ricette[0].attiva && d.ricette[0].operazione.is_none());
         // finche' l'utente non ha controllato, niente altre operazioni
-        let mai = |_: &Ricetta, _: Option<Sessione>, _: Fasi| -> Result<Spostamento, Errore> { panic!("no") };
+        let mai =
+            |_: &Ricetta, _: Option<Sessione>, _: Scelta, _: Fasi| -> Result<Spostamento, Errore> { panic!("no") };
         assert!(sposta(&s, 1, CHIAVE, &mai, &|| {}).unwrap_err().contains("Ho controllato"));
         registro_pulito(&s);
         std::fs::remove_dir_all(&c).unwrap();
@@ -988,7 +1127,7 @@ mod test {
     #[test]
     fn senza_salvataggio_la_conferma_non_parte_e_un_panico_dopo_la_conferma_e_incerto() {
         let (s, c) = stato("salva");
-        let motore = |_: &Ricetta, _: Option<Sessione>, fase: Fasi| -> Result<Spostamento, Errore> {
+        let motore = |_: &Ricetta, _: Option<Sessione>, _: Scelta, fase: Fasi| -> Result<Spostamento, Errore> {
             std::fs::create_dir(c.join("ricette.cifrate")).unwrap(); // il disco non accetta piu' scritture
             assert!(fase(Fase::Conferma).is_err());
             Err(Errore::Inattesa("Non riesco a salvare lo stato dello spostamento: non confermo".into()))
@@ -998,7 +1137,7 @@ mod test {
         assert!(s.dati().ricette[0].operazione.is_none() && s.dati().ricette[0].incerta.is_none());
         std::fs::remove_dir(c.join("ricette.cifrate")).unwrap();
         // un errore interno dopo la Conferma salvata: esito incerto, mai "non fatto"
-        let rotto = |_: &Ricetta, _: Option<Sessione>, fase: Fasi| -> Result<Spostamento, Errore> {
+        let rotto = |_: &Ricetta, _: Option<Sessione>, _: Scelta, fase: Fasi| -> Result<Spostamento, Errore> {
             fase(Fase::Conferma).unwrap();
             panic!("indice fuori")
         };
@@ -1061,9 +1200,40 @@ mod test {
     }
 
     #[test]
+    fn prima_prenotazione_su_una_data_scelta_tra_tutte() {
+        let (s, c) = stato_nuova("prenota-tutte");
+        // fuori zona, ma la sceglie l'utente; un'altra resta per dopo
+        let fuori = trovata(CHIAVE, "mar 01/12/2026 ore 09:00", Some("fuori zona"), true);
+        let altra = trovata("202612050900|CTOAMB", "sab 05/12/2026 ore 09:00", None, true);
+        {
+            let mut d = s.dati();
+            let r = &mut d.ricette[0];
+            r.automatica = true;
+            let e = r.esito.as_mut().unwrap();
+            (e.buone, e.tutte) = (vec![altra.clone()], vec![fuori.clone(), altra.clone()]);
+        }
+        let regola = Cell::new(None);
+        let motore = |_: &Ricetta, _: Option<Sessione>, scelta: Scelta, fase: Fasi| {
+            regola.set(Some(scelta));
+            fase(Fase::Conferma).unwrap();
+            Ok(prenotata())
+        };
+        // la prenotazione automatica no: non e' tra le buone
+        assert!(prenota_da_sola(&s, 1, CHIAVE, &motore).is_err() && regola.get().is_none());
+        let f = prenota(&s, 1, CHIAVE, &motore, &|| {}).unwrap();
+        assert!(f.ok && f.messaggio.contains("La prenotazione automatica è spenta"));
+        assert_eq!(regola.get(), Some(Scelta::Qualsiasi));
+        let r = s.archivio.leggi().unwrap().ricette[0].clone();
+        let e = r.esito.unwrap();
+        // prenotata; l'altra data resta, per spostarla li' se si cambia idea
+        assert!(!r.nuova && !r.automatica && e.buone.is_empty() && e.tutte == [altra]);
+        std::fs::remove_dir_all(&c).unwrap();
+    }
+
+    #[test]
     fn prima_prenotazione_poi_si_cercano_date_prima() {
         let (s, c) = stato_nuova("prenota");
-        let motore = |r: &Ricetta, _: Option<Sessione>, fase: Fasi| {
+        let motore = |r: &Ricetta, _: Option<Sessione>, _: Scelta, fase: Fasi| {
             assert!(r.nuova && s.in_corso().get(&1) == Some(&Attivita::Prenotazione));
             fase(Fase::Conferma).unwrap();
             let op = s.archivio.leggi().unwrap().ricette[0].operazione.clone().unwrap();
@@ -1089,11 +1259,12 @@ mod test {
         assert!(e.nota.unwrap().contains("Prenotazione fatta"));
         registro_pulito(&s);
         // gia' prenotata: "Prenota qui" non vale piu', si sposta
-        let mai = |_: &Ricetta, _: Option<Sessione>, _: Fasi| -> Result<Prenotata, Errore> { panic!("no") };
+        let mai = |_: &Ricetta, _: Option<Sessione>, _: Scelta, _: Fasi| -> Result<Prenotata, Errore> { panic!("no") };
         assert!(prenota(&s, 1, CHIAVE, &mai, &|| {}).unwrap_err().contains("già prenotata"));
         // e al contrario: una ricetta mai prenotata non si "sposta"
         s.dati().ricette[0].nuova = true;
-        let mai = |_: &Ricetta, _: Option<Sessione>, _: Fasi| -> Result<Spostamento, Errore> { panic!("no") };
+        let mai =
+            |_: &Ricetta, _: Option<Sessione>, _: Scelta, _: Fasi| -> Result<Spostamento, Errore> { panic!("no") };
         assert!(sposta(&s, 1, CHIAVE, &mai, &|| {}).unwrap_err().contains("Prenota qui"));
         std::fs::remove_dir_all(&c).unwrap();
     }
@@ -1101,7 +1272,7 @@ mod test {
     #[test]
     fn prenotata_nel_frattempo_o_esito_incerto() {
         let (s, c) = stato_nuova("prenota-gia");
-        let gia = |_: &Ricetta, _: Option<Sessione>, _: Fasi| -> Result<Prenotata, Errore> {
+        let gia = |_: &Ricetta, _: Option<Sessione>, _: Scelta, _: Fasi| -> Result<Prenotata, Errore> {
             Err(Errore::GiaPrenotata("Nel frattempo la ricetta risulta prenotata al gio 07/01/2027 ore 09:00".into()))
         };
         let f = prenota(&s, 1, CHIAVE, &gia, &|| {}).unwrap();
@@ -1111,7 +1282,7 @@ mod test {
         assert!(s.registro.ultime(1)[0].ends_with("prenotazione non fatta (la ricetta risulta già prenotata)"));
         // dopo la Conferma senza verifica: incerta, come uno spostamento
         let (s, c2) = stato_nuova("prenota-incerta");
-        let incerto = |_: &Ricetta, _: Option<Sessione>, fase: Fasi| -> Result<Prenotata, Errore> {
+        let incerto = |_: &Ricetta, _: Option<Sessione>, _: Scelta, fase: Fasi| -> Result<Prenotata, Errore> {
             fase(Fase::Conferma).unwrap();
             Err(Errore::Incerto("Conferma inviata, esito incerto".into()))
         };

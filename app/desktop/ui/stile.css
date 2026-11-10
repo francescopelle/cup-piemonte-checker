@@ -150,3 +150,10 @@ details.tutte summary { font-size: 0.85rem; color: var(--tenue); }
 .in-riga input { flex: 1; }
 .in-riga button { padding: 6px 10px; font-size: 0.85rem; }
 input[type=radio] { padding: 0; margin: 0; }
+/* tutte le date trovate: quelle che non vanno bene con il bordo tenue, e il perche' */
+ul.date li.altra { border-color: var(--bordo); }
+ul.date .stato-data { font-size: 0.8rem; color: var(--tenue); }
+ul.date li.buona .stato-data { color: var(--buono); }
+.ordine { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.ordine button { padding: 3px 9px; font-size: 0.8rem; }
+.ordine button.scelto { background: var(--accento); color: #fff; }

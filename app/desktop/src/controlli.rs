@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 use chrono::NaiveDate;
 use cup_core::analisi::breve;
 use cup_core::distanza::{km_breve, la_piu_vicina};
+use cup_core::portale::NON_INSIEME;
+use cup_core::zona::{NON_PRIMA, NON_SCEGLIBILE};
 use cup_core::{zona, Calendario, Controllo, Criterio, Dove, Errore, Sessione, Slot, Zona};
 use serde::Serialize;
 
@@ -223,7 +225,26 @@ fn data(s: &Slot) -> Data {
         luogo: s.luogo.to_string(),
         proposta: s.proposta,
         comune: zona::comune(&s.luogo),
+        perche: None,
+        sceglibile: true,
     }
+}
+
+/// Tutte le date offerte, ognuna con il perche' non va bene (senza "non e' prima della prenotazione", che dipende
+/// dalla prenotazione di adesso: vedi `Esito::perche`) e se si puo' scegliere.
+fn tutte(c: &Controllo) -> Vec<Data> {
+    c.slots
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let p = c.perche.get(i).copied().flatten();
+            Data {
+                perche: p.filter(|m| *m != NON_PRIMA).map(String::from),
+                sceglibile: !matches!(p, Some(NON_SCEGLIBILE | NON_INSIEME)),
+                ..data(s)
+            }
+        })
+        .collect()
 }
 
 /// Aggiorna la ricetta con l'esito di un controllo: prenotazione, date buone, errori, pausa. Restituisce le notifiche
@@ -296,6 +317,7 @@ pub fn applica(r: &mut Ricetta, esito: Result<Controllo, Errore>, zona: &Zona, t
                 zona: zona.dove.descrizione(a),
                 date: c.slots.len(),
                 buone,
+                tutte: tutte(&c),
                 area_incompleta: c.area_incompleta,
                 errore: None,
                 nota: None,
@@ -317,6 +339,7 @@ pub fn applica(r: &mut Ricetta, esito: Result<Controllo, Errore>, zona: &Zona, t
                 controllo: false,
                 errore: None,
                 buone: vec![],
+                tutte: vec![],
                 date: 0,
                 nota: Some(format!("{m}: al prossimo controllo l'app legge la prenotazione e cerca date prima.")),
                 ..prima
@@ -360,6 +383,7 @@ pub fn applica(r: &mut Ricetta, esito: Result<Controllo, Errore>, zona: &Zona, t
                 controllo: true,
                 errore: Some(e.to_string()),
                 buone: vec![],
+                tutte: vec![],
                 date: 0,
                 nota: None,
                 ..prima
@@ -674,6 +698,7 @@ mod test {
                 riga: 0,
             }),
             prestazioni: vec![],
+            perche: vec![None; migliori.len()],
             slots: migliori.clone(),
             migliori,
             area_incompleta: false,
@@ -788,6 +813,34 @@ mod test {
         assert!(righe[0].ends_with("ASTI (AT) · stesso comune") && righe[3] == "e altre 2 date: le vedi nell'app");
         // le date buone ricordano il comune della sede, per le distanze nell'app
         assert_eq!(r.esito.unwrap().buone[4].comune, "TORINO");
+    }
+
+    #[test]
+    fn tutte_le_date_offerte_con_il_perche() {
+        let mut r = ricetta();
+        let zona = zona_di(&r).unwrap().0;
+        let mut senza = slot(3, "SENZA");
+        senza.seleziona = None;
+        let tardi = Slot { quando: quando(31, 12), ..slot(31, "TARDI") }; // dopo la prenotazione (31/12 ore 11)
+        let mut c = controllo(vec![slot(1, "MAURIZIANO")]);
+        c.slots = vec![slot(1, "MAURIZIANO"), slot_a(2, "OSPEDALE", "- ASTI (AT)"), senza, tardi];
+        c.perche = vec![None, Some("fuori zona"), Some(NON_SCEGLIBILE), Some(NON_PRIMA)];
+        applica(&mut r, Ok(c), &zona, 10);
+        let e = r.esito.clone().unwrap();
+        let perche: Vec<Option<&str>> = e.tutte.iter().map(|d| d.perche.as_deref()).collect();
+        // "non e' prima" non si scrive: dipende dalla prenotazione di adesso, che puo' cambiare
+        assert_eq!(perche, [None, Some("fuori zona"), Some(NON_SCEGLIBILE), None]);
+        assert_eq!(e.tutte.iter().map(|d| d.sceglibile).collect::<Vec<_>>(), [true, true, false, true]);
+        assert_eq!(e.perche(&e.tutte[3]).as_deref(), Some(NON_PRIMA));
+        assert_eq!((e.buone.len(), e.date, e.tutte[1].comune.as_str()), (1, 4, "ASTI"));
+        // una ricetta mai prenotata con piu' prestazioni: le date non proposte non si scelgono
+        let mut c = controllo(vec![]);
+        (c.elenco, c.slots, c.perche) = (None, vec![slot(4, "A")], vec![Some(NON_INSIEME)]);
+        applica(&mut r, Ok(c), &zona, 15);
+        assert!(!r.esito.as_ref().unwrap().tutte[0].sceglibile);
+        // un errore: le date di prima non valgono piu'
+        applica(&mut r, Err(Errore::Timeout), &zona, 20);
+        assert!(r.esito.unwrap().tutte.is_empty());
     }
 
     #[test]

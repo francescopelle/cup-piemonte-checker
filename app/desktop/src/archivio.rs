@@ -10,9 +10,9 @@ use std::path::{Path, PathBuf};
 
 use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
-use chrono::NaiveDate;
+use chrono::{NaiveDate, NaiveDateTime};
 use cup_core::analisi::breve;
-use cup_core::zona::{self, prima_data_utile};
+use cup_core::zona::{self, prima_data_utile, NON_PRIMA};
 use cup_core::{Contatti, Criterio, Prenotazione, Punto, Slot};
 use serde::{Deserialize, Serialize};
 
@@ -65,7 +65,7 @@ impl Visita {
     }
 }
 
-/// Una data buona trovata da un controllo.
+/// Una data trovata da un controllo.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Data {
     /// Data e luogo: la stessa data trovata in due controlli ha la stessa chiave (per non notificarla due volte).
@@ -77,6 +77,26 @@ pub struct Data {
     /// partenza di adesso: se l'utente lo cambia, le distanze cambiano subito.
     #[serde(default)]
     pub comune: String,
+    /// Perche' la data non rispetta le scelte dell'utente (zona, giorni, prima data utile...), come l'ha letto il
+    /// controllo; None se le rispetta. Se e' prima della prenotazione non si scrive qui: la prenotazione puo' cambiare
+    /// dopo il controllo (vedi `Esito::perche`).
+    #[serde(default)]
+    pub perche: Option<String>,
+    /// Si puo' scegliere sul portale: ha "Seleziona" (o e' la proposta) e, con piu' prestazioni da prenotare insieme,
+    /// e' la proposta.
+    #[serde(default = "si")]
+    pub sceglibile: bool,
+}
+
+fn si() -> bool {
+    true
+}
+
+impl Data {
+    /// Data e ora, dalla chiave ("202612010900|...").
+    pub fn istante(&self) -> Option<NaiveDateTime> {
+        NaiveDateTime::parse_from_str(self.chiave.get(..12)?, "%Y%m%d%H%M").ok()
+    }
 }
 
 /// Com'e' andato l'ultimo controllo.
@@ -95,6 +115,11 @@ pub struct Esito {
     pub date: usize,
     /// Quelle che vanno bene, dalla piu' vicina.
     pub buone: Vec<Data>,
+    /// Tutte le date offerte dal portale nell'ultimo controllo, dalla piu' vicina nel tempo, anche quelle che non vanno
+    /// bene: l'utente le vede tutte e puo' scegliere una qualsiasi, anche dopo che l'app ha spostato o prenotato (la
+    /// data presa si toglie, le altre restano fino al controllo dopo).
+    #[serde(default)]
+    pub tutte: Vec<Data>,
     pub area_incompleta: bool,
     pub errore: Option<String>,
     /// Una riga da mostrare al posto del riepilogo del controllo ("Prenotazione disdetta.").
@@ -109,6 +134,30 @@ pub struct Esito {
     /// Ricetta mai prenotata con piu' prestazioni: va bene solo la data proposta, per tutte insieme.
     #[serde(default)]
     pub solo_proposta: bool,
+}
+
+impl Esito {
+    /// Una data trovata dall'ultimo controllo, tra quelle buone o tra tutte.
+    pub fn trovata(&self, chiave: &str) -> Option<&Data> {
+        self.buone.iter().chain(&self.tutte).find(|d| d.chiave == chiave)
+    }
+
+    /// Perche' una data trovata non va bene adesso; None se va bene. Il motivo letto dal controllo (zona, giorni,
+    /// prima data utile) o, se no, se non e' prima della prenotazione di adesso: dopo uno spostamento dell'app la
+    /// prenotazione non e' piu' quella con cui il controllo ha scelto le date buone.
+    pub fn perche(&self, d: &Data) -> Option<String> {
+        if self.buone.iter().any(|b| b.chiave == d.chiave) {
+            return None;
+        }
+        if let Some(p) = &d.perche {
+            return Some(p.clone());
+        }
+        let Some(attuale) = &self.attuale else { return None };
+        match (d.istante(), NaiveDateTime::parse_from_str(&attuale.iso, ISO)) {
+            (Some(q), Ok(a)) if q < a => None,
+            _ => Some(NON_PRIMA.into()),
+        }
+    }
 }
 
 /// Uno spostamento o una disdetta oltre la Conferma: salvato prima di inviarla, tolto quando l'esito e' noto. Se
@@ -560,6 +609,50 @@ pub(crate) mod test {
         assert_eq!((r.criterio(), r.dal()), (Criterio::Distanza, NaiveDate::from_ymd_opt(2027, 1, 10)));
         let riletta: Ricetta = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert_eq!(riletta, r);
+    }
+
+    #[test]
+    fn perche_una_data_trovata_non_va_bene_adesso() {
+        let data = |chiave: &str, perche: Option<&str>| Data {
+            chiave: chiave.into(),
+            quando: String::new(),
+            luogo: String::new(),
+            proposta: false,
+            comune: String::new(),
+            perche: perche.map(String::from),
+            sceglibile: true,
+        };
+        let buona = data("202612010900|A", None);
+        let fuori = data("202612020900|B", Some("fuori zona"));
+        let dopo = data("202701200900|C", None);
+        let mut e = Esito {
+            attuale: Some(Visita {
+                quando: String::new(),
+                luogo: String::new(),
+                cosa: String::new(),
+                iso: "2027-01-07T11:45".into(),
+                chiave_luogo: String::new(),
+                comune: String::new(),
+            }),
+            buone: vec![buona.clone()],
+            tutte: vec![buona.clone(), fuori.clone(), dopo.clone()],
+            ..Default::default()
+        };
+        assert_eq!((e.perche(&buona), e.perche(&fuori)), (None, Some("fuori zona".into())));
+        assert_eq!(e.perche(&dopo).as_deref(), Some(NON_PRIMA));
+        assert_eq!(e.trovata("202701200900|C"), Some(&dopo));
+        assert!(e.trovata("202701200900|X").is_none());
+        // dopo uno spostamento al 1 febbraio (le buone si svuotano): il 20 gennaio adesso e' prima
+        e.buone.clear();
+        e.attuale.as_mut().unwrap().iso = "2027-02-01T09:00".into();
+        assert_eq!((e.perche(&dopo), e.perche(&buona)), (None, None));
+        // senza prenotazione conta solo il motivo del controllo
+        e.attuale = None;
+        assert_eq!((e.perche(&dopo), e.perche(&fuori)), (None, Some("fuori zona".into())));
+        // le date salvate prima della 0.4.0 si potevano scegliere tutte
+        let vecchia: Data =
+            serde_json::from_str(r#"{"chiave":"k","quando":"q","luogo":"l","proposta":false}"#).unwrap();
+        assert!(vecchia.sceglibile && vecchia.perche.is_none() && vecchia.istante().is_none());
     }
 
     #[test]

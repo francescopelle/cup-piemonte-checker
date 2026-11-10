@@ -15,10 +15,10 @@ use std::sync::Arc;
 use chrono::{Local, TimeZone};
 use cup_core::analisi::credenziali;
 use cup_core::contatti;
-use cup_core::distanza::{km_breve, la_piu_vicina};
-use cup_core::operazioni::{Attese, Prenotata, Spostamento};
+use cup_core::distanza::{km_breve, la_piu_vicina, ordina};
+use cup_core::operazioni::{Attese, Prenotata, Scelta, Spostamento};
 use cup_core::zona::{self, prima_data_utile};
-use cup_core::{Criterio, Dove, Errore, Prenotazione, Sessione};
+use cup_core::{Criterio, Dove, Errore, Prenotazione, Punto, Sessione};
 use serde::Serialize;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -58,7 +58,7 @@ fn mascherato(s: &str) -> String {
 
 const GIORNI: [&str; 7] = ["lun", "mar", "mer", "gio", "ven", "sab", "dom"];
 
-/// Una data buona come la mostra l'app: con la distanza dal comune di partenza, se si sa.
+/// Una data trovata come la mostra l'app: con la distanza dal comune di partenza, se si sa, e perche' non va bene.
 #[derive(Serialize)]
 struct DataUi {
     chiave: String,
@@ -67,6 +67,24 @@ struct DataUi {
     proposta: bool,
     /// "12 km", "stesso comune"; None se non si sa.
     distanza: Option<String>,
+    /// Perche' non va bene adesso ("fuori zona", "non è prima della prenotazione"...); None se va bene.
+    stato: Option<String>,
+    /// Si puo' scegliere sul portale (con "Sposta qui" o "Prenota qui").
+    sceglibile: bool,
+}
+
+impl DataUi {
+    fn da(d: &Data, e: &Esito, partenza: Option<&Punto>) -> Self {
+        DataUi {
+            chiave: d.chiave.clone(),
+            quando: d.quando.clone(),
+            luogo: d.luogo.clone(),
+            proposta: d.proposta,
+            distanza: partenza.and_then(|p| p.km_da(&d.comune)).map(km_breve),
+            stato: e.perche(d),
+            sceglibile: d.sceglibile,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -77,6 +95,11 @@ struct EsitoUi {
     date: usize,
     /// Dalla piu' vicina nel tempo.
     buone: Vec<DataUi>,
+    /// Tutte le date offerte dall'ultimo controllo, dalla piu' vicina nel tempo (senza quella presa da uno spostamento
+    /// o da una prenotazione fatti dopo): si possono scegliere anche quelle che non vanno bene.
+    tutte: Vec<DataUi>,
+    /// Le chiavi di `tutte` dalla sede piu' vicina (a parita' di km dalla prima); vuoto se non si sanno le distanze.
+    per_distanza: Vec<String>,
     /// Le due scelte, per chiave: la prima data e la prima nella sede piu' vicina (None se non si sa nessuna
     /// distanza). Possono essere la stessa.
     prima: Option<String>,
@@ -148,7 +171,8 @@ fn scheda(r: &Ricetta, in_corso: Option<Attivita>) -> Scheda {
         giorni.push_str(&format!(", dal {}", d.format("%d/%m/%Y")));
     }
     let partenza = r.partenza();
-    let km = |d: &Data| partenza.as_ref().and_then(|(_, p)| p.km_da(&d.comune));
+    let punto = partenza.as_ref().map(|(_, p)| p);
+    let km = |d: &Data| punto.and_then(|p| p.km_da(&d.comune));
     Scheda {
         id: r.id,
         nome: r.nome.clone(),
@@ -176,17 +200,16 @@ fn scheda(r: &Ricetta, in_corso: Option<Attivita>) -> Scheda {
             controllo: e.controllo,
             attuale: e.attuale.clone(),
             date: e.date,
-            buone: e
-                .buone
-                .iter()
-                .map(|d| DataUi {
-                    chiave: d.chiave.clone(),
-                    quando: d.quando.clone(),
-                    luogo: d.luogo.clone(),
-                    proposta: d.proposta,
-                    distanza: km(d).map(km_breve),
-                })
-                .collect(),
+            buone: e.buone.iter().map(|d| DataUi::da(d, e, punto)).collect(),
+            tutte: e.tutte.iter().map(|d| DataUi::da(d, e, punto)).collect(),
+            per_distanza: match punto {
+                Some(_) => {
+                    let mut v: Vec<&Data> = e.tutte.iter().collect();
+                    ordina(&mut v, Criterio::Distanza, |d| km(d));
+                    v.into_iter().map(|d| d.chiave.clone()).collect()
+                }
+                None => vec![],
+            },
             prima: e.buone.first().map(|d| d.chiave.clone()),
             vicina: la_piu_vicina(e.buone.iter(), |d| km(d)).map(|(d, _)| d.chiave.clone()),
             area_incompleta: e.area_incompleta,
@@ -474,16 +497,18 @@ fn modifica(
     let r = d.ricetta(id)?;
     let evita: Vec<u32> = evita.into_iter().filter(|g| *g < 7).collect();
     if (&r.dove, &r.valore, &r.evita) != (&dove, &valore, &evita) {
-        // la zona letta con la prenotazione non vale piu': le date buone si rivedono al prossimo controllo
+        // la zona letta con la prenotazione non vale piu': le date (e i loro perche') si rivedono al prossimo controllo
         if let Some(e) = r.esito.as_mut() {
             e.zona.clear();
             e.buone.clear();
+            e.tutte.clear();
         }
     }
     if r.dal != dal {
         // le date buone sono state scelte con l'altra prima data utile: si rivedono al prossimo controllo
         if let Some(e) = r.esito.as_mut() {
             e.buone.clear();
+            e.tutte.clear();
         }
         stato
             .registro
@@ -551,6 +576,7 @@ fn sposta_sul_portale(
     r: &Ricetta,
     tenuta: Option<Sessione>,
     chiave: &str,
+    scelta: Scelta,
     fasi: operazioni::Fasi,
 ) -> Result<Spostamento, Errore> {
     let (zona, cal) = zona_di(r)?;
@@ -562,6 +588,7 @@ fn sposta_sul_portale(
         &zona,
         &cal,
         false,
+        scelta,
         &Attese::default(),
         &r.contatti(),
         fasi,
@@ -573,6 +600,7 @@ fn prenota_sul_portale(
     r: &Ricetta,
     tenuta: Option<Sessione>,
     chiave: &str,
+    scelta: Scelta,
     fasi: operazioni::Fasi,
 ) -> Result<Prenotata, Errore> {
     let (zona, cal) = zona_di(r)?;
@@ -584,6 +612,7 @@ fn prenota_sul_portale(
         &zona,
         &cal,
         false,
+        scelta,
         &Attese::default(),
         &r.contatti(),
         fasi,
@@ -596,9 +625,9 @@ fn da_sola(app: &AppHandle, stato: &Stato, id: u64, chiave: &str) -> bool {
     let Some(nuova) = stato.dati().ricette.iter().find(|r| r.id == id).map(|r| r.nuova) else { return false };
     let _ = app.emit("ricette", ());
     let fine = if nuova {
-        operazioni::prenota_da_sola(stato, id, chiave, &|r, t, f| prenota_sul_portale(r, t, chiave, f))
+        operazioni::prenota_da_sola(stato, id, chiave, &|r, t, s, f| prenota_sul_portale(r, t, chiave, s, f))
     } else {
-        operazioni::sposta_da_sola(stato, id, chiave, &|r, t, f| sposta_sul_portale(r, t, chiave, f))
+        operazioni::sposta_da_sola(stato, id, chiave, &|r, t, s, f| sposta_sul_portale(r, t, chiave, s, f))
     };
     let riuscita = match fine {
         Ok(fine) => {
@@ -624,8 +653,8 @@ async fn sposta(app: AppHandle, stato: Condiviso<'_>, id: u64, chiave: String) -
     let st = stato.inner().clone();
     let h = app.clone();
     let fine = tauri::async_runtime::spawn_blocking(move || {
-        let motore = |r: &Ricetta, tenuta: Option<Sessione>, fasi: operazioni::Fasi| {
-            sposta_sul_portale(r, tenuta, &chiave, fasi)
+        let motore = |r: &Ricetta, tenuta: Option<Sessione>, scelta: Scelta, fasi: operazioni::Fasi| {
+            sposta_sul_portale(r, tenuta, &chiave, scelta, fasi)
         };
         operazioni::sposta(&st, id, &chiave, &motore, &|| {
             let _ = h.emit("ricette", ());
@@ -642,8 +671,8 @@ async fn prenota(app: AppHandle, stato: Condiviso<'_>, id: u64, chiave: String) 
     let st = stato.inner().clone();
     let h = app.clone();
     let fine = tauri::async_runtime::spawn_blocking(move || {
-        let motore = |r: &Ricetta, tenuta: Option<Sessione>, fasi: operazioni::Fasi| {
-            prenota_sul_portale(r, tenuta, &chiave, fasi)
+        let motore = |r: &Ricetta, tenuta: Option<Sessione>, scelta: Scelta, fasi: operazioni::Fasi| {
+            prenota_sul_portale(r, tenuta, &chiave, scelta, fasi)
         };
         operazioni::prenota(&st, id, &chiave, &motore, &|| {
             let _ = h.emit("ricette", ());
@@ -1082,6 +1111,8 @@ mod test {
             luogo: format!("{sede}, AMB, {comune}"),
             proposta: false,
             comune: comune.into(),
+            perche: None,
+            sceglibile: true,
         }
     }
 
@@ -1110,8 +1141,34 @@ mod test {
             ],
             ..Default::default()
         });
+        r.esito.as_mut().unwrap().tutte = {
+            let e = r.esito.as_ref().unwrap();
+            let mut fuori = data(4, "OSPEDALE", "ALBA");
+            fuori.perche = Some("fuori zona".into());
+            let mut tardi = data(20, "CTO", "CUNEO");
+            tardi.chiave = "202701200900|CTO".into(); // dopo la prenotazione del 7 gennaio
+            let mut tutte = e.buone.clone();
+            tutte.extend([fuori, tardi]);
+            tutte
+        };
         let v = serde_json::to_value(scheda(&r, None)).unwrap();
         let e = &v["esito"];
+        // tutte le date, con perche' non vanno bene; e in fila per distanza (Torino, Moncalieri, Asti, Alba, Cuneo)
+        let stati: Vec<&serde_json::Value> = e["tutte"].as_array().unwrap().iter().map(|d| &d["stato"]).collect();
+        assert!(stati[..3].iter().all(|s| s.is_null()) && stati[3] == "fuori zona");
+        assert_eq!(stati[4], "non è prima della prenotazione");
+        assert!(e["tutte"].as_array().unwrap().iter().all(|d| d["sceglibile"] == true));
+        let fila: Vec<&str> = e["per_distanza"].as_array().unwrap().iter().map(|k| k.as_str().unwrap()).collect();
+        assert_eq!(
+            fila,
+            [
+                "202612030900|CTO",
+                "202612020900|SANTA CROCE",
+                "202612010900|CARDINAL MASSAIA",
+                "202612040900|OSPEDALE",
+                "202701200900|CTO"
+            ]
+        );
         // la prima nel tempo (Asti) e la piu' vicina al comune della prenotazione (Torino)
         assert_eq!(e["prima"], "202612010900|CARDINAL MASSAIA");
         assert_eq!(e["vicina"], "202612030900|CTO");
@@ -1138,6 +1195,7 @@ mod test {
                 && v["distanze_da"].is_null()
                 && v["esito"]["buone"][0]["distanza"].is_null()
         );
+        assert!(v["esito"]["per_distanza"].as_array().unwrap().is_empty());
         // la prima data utile: per il calendario del modulo e, se non e' passata, accanto ai giorni
         r.dal = "2099-03-01".into();
         let v = serde_json::to_value(scheda(&r, None)).unwrap();

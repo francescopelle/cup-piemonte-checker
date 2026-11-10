@@ -22,6 +22,7 @@ comportamento del portale, che lì sono già state verificate.
 | 6 | Ricette mai prenotate: cerca il primo posto libero e prenota, solo quando lo chiedi tu | ✅ fatto (0.2.0, sperimentale) |
 | 7 | Aggiornamenti automatici, firmati, mai durante un'operazione | ✅ fatto (0.3.0) |
 | 8 | Prima data utile; la prima data o la sede più vicina, nell'app e nella prenotazione automatica | ✅ fatto (0.4.0) |
+| 9 | Tutte le date trovate, anche quelle che non vanno bene; sostituire la prenotazione con una di loro, anche dopo | ✅ fatto (0.4.0) |
 
 **Come si usa.** Si aggiunge una ricetta con nome, codice fiscale e numero ricetta, la zona e i giorni da
 evitare; se si vuole, la prima data utile e il comune da cui si parte. L'app legge la prenotazione (solo lettura; se non c'è, la ricetta da prenotare) e poi, se la ricetta è attiva, la controlla da sola ogni
@@ -44,7 +45,8 @@ per passo:
 - riusa la sessione del controllo che ha trovato la data, che tiene bloccata la proposta, se ha meno di
   35 minuti; altrimenti ne apre una nuova;
 - prima di confermare rilegge la prenotazione e controlla che la data vada ancora bene (zona, giorni,
-  prima della prenotazione);
+  prima data utile, prima della prenotazione); per una data scelta da "Tutte le date trovate" che non va bene
+  (vedi sotto) controlla solo che si possa scegliere;
 - controlla che il Riepilogo riporti la stessa data, lo stesso luogo e la stessa prestazione. Se più
   prestazioni sono prenotate insieme, si spostano tutte o nessuna;
 - se il Riepilogo ha delle note, fa la presa visione; le note (per esempio la preparazione all'esame)
@@ -52,6 +54,22 @@ per passo:
 - dopo la Conferma rilegge l'elenco con sessioni nuove, fino a 3 minuti, per verificare che sia andata.
 
 La disdetta preme "Disdici" sulla riga giusta e "Sì" nel dialogo, poi verifica allo stesso modo.
+
+**Tutte le date trovate** (dalla versione 0.4.0). Sotto le date buone la scheda ha "Tutte le date trovate
+dall'ultimo controllo": ogni data che il portale ha offerto, anche quelle che non vanno bene, ciascuna con il
+perché (fuori zona, giorno da evitare, prima della prima data utile, non prima della prenotazione), la distanza e,
+se si può scegliere, "Sposta qui" (o "Prenota qui"). Si mettono in fila per data o per distanza.
+- **Si può scegliere una qualsiasi**, anche più tardi della prenotazione o fuori dalla zona: la conferma dice
+  perché non va bene (e che la data attuale si libera e potrebbe non tornare). Prima di confermare l'app controlla
+  solo che si possa ancora scegliere sul portale; Riepilogo, presa visione e verifica sono quelli di sempre. Non si
+  scelgono le date senza "Seleziona" e, con più prestazioni da prenotare insieme, quelle diverse dalla proposta.
+- **Anche a posteriori**: dopo uno spostamento o una prenotazione, anche automatici, le altre date dell'ultimo
+  controllo restano nell'elenco (tranne quella presa), e la prenotazione si sostituisce con una di loro come
+  sopra; quelle prima della nuova prenotazione tornano "buone". L'elenco si rinnova al controllo dopo e si svuota
+  dopo un errore, una disdetta, un esito incerto o se si cambiano zona, giorni o prima data utile.
+- **La prenotazione automatica sceglie solo date buone.** Se l'utente sceglie una data che non va bene e
+  l'automatica è accesa, dopo lo spostamento la spegne (e lo dice): se no al controllo dopo la riporterebbe su una
+  data che va bene, contro la sua scelta.
 
 Prima della Conferma l'app salva sul disco che l'operazione sta partendo; se non ci riesce, non conferma.
 Se dopo la Conferma non riesce a verificare l'esito, o se si chiude a metà, lo dice con una notifica. In quel
@@ -118,8 +136,8 @@ prenotata senza comune di partenza non ha distanze.
 
 - **Senza prenotazione automatica** l'app mostra le due scelte in cima alla scheda: ⏱ **la prima** data
   buona e 📍 **la più vicina**, cioè la prima data nella sede più vicina (se sono la stessa, una sola). Le
-  altre date sono sotto, in "Altre date che vanno bene". La notifica delle date nuove scrive le prime tre con
-  la distanza e, se non è tra quelle, anche la più vicina.
+  altre sono sotto, in "Tutte le date trovate", in fila per data o per distanza. La notifica delle date nuove
+  scrive le prime tre con la distanza e, se non è tra quelle, anche la più vicina.
 - **Con la prenotazione automatica** si sceglie quale prende: "la prima data, dove che sia" (vicinanza nel
   tempo, come prima della 0.4.0) o "la sede più vicina al comune da cui parti, alla prima data lì" (vicinanza
   nello spazio). Se nessuna data ha una distanza nota (nessun comune di partenza, o comuni che non si leggono),
