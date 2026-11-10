@@ -21,9 +21,11 @@ comportamento del portale, che lì sono già state verificate.
 | 5 | Installer per i tre sistemi (GitHub Actions) | ✅ fatto |
 | 6 | Ricette mai prenotate: cerca il primo posto libero e prenota, solo quando lo chiedi tu | ✅ fatto (0.2.0, sperimentale) |
 | 7 | Aggiornamenti automatici, firmati, mai durante un'operazione | ✅ fatto (0.3.0) |
+| 8 | Prima data utile; la prima data o la sede più vicina, nell'app e nella prenotazione automatica | ✅ fatto (0.4.0) |
+| 9 | Tutte le date trovate, anche quelle che non vanno bene; sostituire la prenotazione con una di loro, anche dopo | ✅ fatto (0.4.0) |
 
 **Come si usa.** Si aggiunge una ricetta con nome, codice fiscale e numero ricetta, la zona e i giorni da
-evitare. L'app legge la prenotazione (solo lettura; se non c'è, la ricetta da prenotare) e poi, se la ricetta è attiva, la controlla da sola ogni
+evitare; se si vuole, la prima data utile e il comune da cui si parte. L'app legge la prenotazione (solo lettura; se non c'è, la ricetta da prenotare) e poi, se la ricetta è attiva, la controlla da sola ogni
 20 minuti. Quando esce una data che va bene arriva una notifica del sistema con data, ora e luogo, una
 volta sola per data. Chiudendo la finestra l'app resta nella barra di sistema e continua; si esce dal menu
 dell'icona. Nelle impostazioni si può farla partire con il computer.
@@ -43,7 +45,8 @@ per passo:
 - riusa la sessione del controllo che ha trovato la data, che tiene bloccata la proposta, se ha meno di
   35 minuti; altrimenti ne apre una nuova;
 - prima di confermare rilegge la prenotazione e controlla che la data vada ancora bene (zona, giorni,
-  prima della prenotazione);
+  prima data utile, prima della prenotazione); per una data scelta da "Tutte le date trovate" che non va bene
+  (vedi sotto) controlla solo che si possa scegliere;
 - controlla che il Riepilogo riporti la stessa data, lo stesso luogo e la stessa prestazione. Se più
   prestazioni sono prenotate insieme, si spostano tutte o nessuna;
 - se il Riepilogo ha delle note, fa la presa visione; le note (per esempio la preparazione all'esame)
@@ -51,6 +54,22 @@ per passo:
 - dopo la Conferma rilegge l'elenco con sessioni nuove, fino a 3 minuti, per verificare che sia andata.
 
 La disdetta preme "Disdici" sulla riga giusta e "Sì" nel dialogo, poi verifica allo stesso modo.
+
+**Tutte le date trovate** (dalla versione 0.4.0). Sotto le date buone la scheda ha "Tutte le date trovate
+dall'ultimo controllo": ogni data che il portale ha offerto, anche quelle che non vanno bene, ciascuna con il
+perché (fuori zona, giorno da evitare, prima della prima data utile, non prima della prenotazione), la distanza e,
+se si può scegliere, "Sposta qui" (o "Prenota qui"). Si mettono in fila per data o per distanza.
+- **Si può scegliere una qualsiasi**, anche più tardi della prenotazione o fuori dalla zona: la conferma dice
+  perché non va bene (e che la data attuale si libera e potrebbe non tornare). Prima di confermare l'app controlla
+  solo che si possa ancora scegliere sul portale; Riepilogo, presa visione e verifica sono quelli di sempre. Non si
+  scelgono le date senza "Seleziona" e, con più prestazioni da prenotare insieme, quelle diverse dalla proposta.
+- **Anche a posteriori**: dopo uno spostamento o una prenotazione, anche automatici, le altre date dell'ultimo
+  controllo restano nell'elenco (tranne quella presa), e la prenotazione si sostituisce con una di loro come
+  sopra; quelle prima della nuova prenotazione tornano "buone". L'elenco si rinnova al controllo dopo e si svuota
+  dopo un errore, una disdetta, un esito incerto o se si cambiano zona, giorni o prima data utile.
+- **La prenotazione automatica sceglie solo date buone.** Se l'utente sceglie una data che non va bene e
+  l'automatica è accesa, dopo lo spostamento la spegne (e lo dice): se no al controllo dopo la riporterebbe su una
+  data che va bene, contro la sua scelta.
 
 Prima della Conferma l'app salva sul disco che l'operazione sta partendo; se non ci riesce, non conferma.
 Se dopo la Conferma non riesce a verificare l'esito, o se si chiude a metà, lo dice con una notifica. In quel
@@ -60,10 +79,12 @@ controllo.
 
 **Prenotazione automatica** (dalla versione 0.3.2, facoltativa, spenta finché non la accendi in "Modifica" o
 quando aggiungi la ricetta). Dopo un controllo che trova date buone l'app sposta da sola la prenotazione, o
-prenota una ricetta mai prenotata, sulla data più vicina, con lo stesso spostamento di "Sposta qui" e la
-sessione del controllo appena fatto. Come la conferma automatica del bot:
-- solo date che vanno bene (prima della prenotazione, nella zona scelta, nei giorni che non eviti), con una
-  sede, mai per oggi;
+prenota una ricetta mai prenotata, con lo stesso spostamento di "Sposta qui" e la sessione del controllo
+appena fatto. Su quale data lo sceglie l'utente (dalla versione 0.4.0; vedi
+[Prima data o sede più vicina](#prima-data-o-sede-più-vicina)): la prima, dove che sia (come prima della 0.4.0),
+oppure la prima nella sede più vicina al comune da cui parte. Come la conferma automatica del bot:
+- solo date che vanno bene (prima della prenotazione, nella zona scelta, nei giorni che non eviti, dalla prima
+  data utile), con una sede, mai per oggi;
 - ogni data la prova una volta sola: la data tentata si salva sul disco prima di toccare il portale;
 - una notifica con data, ora e luogo, sia se riesce sia se non riesce (la data trovata non si notifica a
   parte);
@@ -98,7 +119,52 @@ pulsanti, mai dati personali. Un passo che il portale salta, invece, non dà pro
 Torino e prima cintura, la provincia o dove propone il CUP. Per comune, comuni e provincia l'app preme
 "Estendi area di ricerca", così compaiono anche le aziende sanitarie più lontane. I comuni del Piemonte
 sono in `core/data/comuni_piemonte.txt` (ISTAT). Una data va bene se è nella zona, non cade in un giorno
-da evitare ed è prima della prenotazione.
+da evitare, non è prima della prima data utile ed è prima della prenotazione.
+
+**Prima data utile** (dalla versione 0.4.0, facoltativa). Un giorno da cui in poi si può andare: le date
+prima non si propongono, non si notificano e non si prenotano, nemmeno in automatico (quel giorno compreso va
+bene). Prima di confermare uno spostamento l'app ricontrolla anche questa. Se la prenotazione attuale è prima di
+quel giorno (per esempio si è via), vanno bene anche date dopo la prenotazione, dalla prima data utile in poi:
+come per una prenotazione che cade in un giorno da evitare, dopo lo spostamento la nuova data è in un giorno
+buono e non si sposta più da sola. Una prima data utile già passata non cambia nulla.
+
+### Prima data o sede più vicina
+
+Dalla versione 0.4.0 ogni data buona ha la sua distanza dal **comune di partenza**: quello scritto
+nella ricetta ("Comune da cui parti", facoltativo) o, se manca, quello della prenotazione. Una ricetta mai
+prenotata senza comune di partenza non ha distanze.
+
+- **Senza prenotazione automatica** l'app mostra le due scelte in cima alla scheda: ⏱ **la prima** data
+  buona e 📍 **la più vicina**, cioè la prima data nella sede più vicina (se sono la stessa, una sola). Le
+  altre sono sotto, in "Tutte le date trovate", in fila per data o per distanza. La notifica delle date nuove
+  scrive le prime tre con la distanza e, se non è tra quelle, anche la più vicina.
+- **Con la prenotazione automatica** si sceglie quale prende: "la prima data, dove che sia" (vicinanza nel
+  tempo, come prima della 0.4.0) o "la sede più vicina al comune da cui parti, alla prima data lì" (vicinanza
+  nello spazio). Se nessuna data ha una distanza nota (nessun comune di partenza, o comuni che non si leggono),
+  prende la prima. Ogni data la prova sempre una volta sola: se la più vicina non riesce, al controllo dopo
+  prova la successiva per distanza.
+
+Come si calcola (`core/src/distanza.rs`), scelto per essere veloce, preciso quanto i dati lo permettono e senza
+mandare nulla in rete:
+- **dove stanno le sedi**: il portale scrive di ogni sede solo l'indirizzo, da cui l'app legge il comune
+  (come per le zone). Ogni comune ha le coordinate del suo centro nel file dei comuni già dentro l'app: una
+  tabella in memoria letta una volta, con ricerca per nome in tempo costante. Niente servizi di geocodifica:
+  il comune dell'utente e i luoghi delle visite non escono dal computer;
+- **la distanza**: in linea d'aria sulla sfera terrestre (formula dell'emisenoverso, *haversine*), qualche
+  operazione per data, arrotondata al km. Di più sarebbe una precisione finta, perché i punti sono i centri dei
+  comuni: tutte le sedi dello stesso comune sono "stesso comune" e fra loro conta la data. È una distanza in
+  linea d'aria, non su strada: nelle valli la strada può essere più lunga;
+- **l'ordine**: le date arrivano dal portale già dalla più vicina nel tempo. La più vicina nello spazio è il
+  minimo per km in un solo passaggio sulle date (O(n), una distanza per data), a parità di km la prima nel
+  tempo; per mettere in fila tutte le date basta un ordinamento stabile per km (O(n log n)). Le date di cui non
+  si legge il comune vanno in fondo;
+- **quando**: le distanze si calcolano quando servono (scheda, notifica, prenotazione automatica) dal comune
+  di partenza di quel momento, non al controllo: cambiato il comune di partenza o la preferenza, l'ordine
+  cambia subito, senza aspettare un controllo (che bloccherebbe un'altra data). Cambiare la prima data utile
+  invece cambia quali date vanno bene: si rivedono al controllo dopo.
+
+Il comune di partenza resta cifrato con le ricette, non va al portale e non finisce nel registro né nelle
+segnalazioni.
 
 ## Installarla
 
@@ -205,6 +271,7 @@ cd app
 cargo test -p cup-core                      # test del motore, senza rete
 cargo run -p cup-cli -- attuale             # chiede codice fiscale e numero ricetta
 cargo run -p cup-cli -- cerca --dove cintura --evita ven   # date prima, chiede conferma
+cargo run -p cup-cli -- cerca --dove provincia --dal 15/12/2026 --da Chieri   # con la prima data utile e i km
 cargo run -p cup-desktop                    # apre la finestra
 ```
 

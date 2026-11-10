@@ -50,6 +50,11 @@ pagina [Releases](https://github.com/ilmondovero/cup-piemonte-checker/releases).
   data buona la sposta o la prenota da sola e te lo dice con data, ora e luogo. Ogni data la prova una
   volta sola, e si spegne da sola se l'esito non è certo o il portale risponde in modo inatteso.
 - **"Copia"** accanto a codice fiscale e ricetta (dalla 0.3.2), per cercarla sul sito del CUP.
+- **La prima data o la sede più vicina** (dalla versione 0.4.0): ogni data ha la distanza dal comune da cui parti
+  (o da quello della prenotazione) e l'app ti mostra sia la prima data sia quella nella sede più vicina. Con la
+  prenotazione automatica scegli tu quale prende. Puoi anche dare una **prima data utile**: niente date prima.
+- **Tutte le date trovate** (dalla 0.4.0): vedi ogni data offerta dal portale, anche quelle che non vanno bene, con
+  il perché, e puoi sostituire la prenotazione con una qualsiasi, anche dopo che l'app l'ha spostata da sola.
 - **Ricetta non ancora prenotata** (dalla versione 0.2.0): cerca il primo posto libero nella zona scelta e
   te lo propone; prenota solo con "Prenota qui" e il tuo "Sì", poi cerca date prima. È una funzione nuova:
   un passo del portale non è ancora stato visto con una ricetta vera, e se qualcosa non torna l'app si

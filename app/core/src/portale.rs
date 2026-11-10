@@ -21,7 +21,7 @@ use chrono::NaiveDateTime;
 use crate::analisi::{self, Elenco, Riepilogo, Slot, A, AVANTI, L, R, RIEPILOGO};
 use crate::contatti::Contatti;
 use crate::errore::Errore;
-use crate::zona::{candidata, Calendario, Zona};
+use crate::zona::{perche_no, Calendario, Zona};
 
 pub const CUP: &str = "https://cup.isan.csi.it";
 /// Tra due ricerche della stessa ricetta: ogni "Sposta" blocca un'altra data per ~40 minuti (il bot non controlla
@@ -158,6 +158,10 @@ pub struct Alternative {
     pub area_incompleta: bool,
 }
 
+/// Perche' non va bene una data non proposta, per una ricetta mai prenotata con piu' prestazioni: si prenota solo
+/// la proposta, che le mette tutte nello stesso appuntamento.
+pub const NON_INSIEME: &str = "non è per tutte le prestazioni insieme";
+
 /// Un controllo completo: la prenotazione, tutte le date offerte e quelle che vanno bene.
 #[derive(Debug, Clone)]
 pub struct Controllo {
@@ -165,7 +169,10 @@ pub struct Controllo {
     pub elenco: Option<Elenco>,
     /// Le prestazioni del carrello di una ricetta mai prenotata.
     pub prestazioni: Vec<String>,
+    /// Tutte le date offerte, dalla piu' vicina nel tempo.
     pub slots: Vec<Slot>,
+    /// Per ogni data di `slots`, perche' non va bene (zona::perche_no, o `NON_INSIEME`); None se va bene.
+    pub perche: Vec<Option<&'static str>>,
     /// Le date da proporre: nella zona, in un giorno si', prima della prenotazione (vedi zona::candidata).
     pub migliori: Vec<Slot>,
     pub area_incompleta: bool,
@@ -652,11 +659,13 @@ impl Sessione {
             }
         }
         let alt = self.alternative(zona.estensioni())?;
-        let migliori = alt.slots.iter().filter(|s| candidata(s, Some(&elenco.attuale), zona, cal)).cloned().collect();
+        let perche: Vec<_> = alt.slots.iter().map(|s| perche_no(s, Some(&elenco.attuale), zona, cal)).collect();
+        let migliori = buone(&alt.slots, &perche);
         Ok(Controllo {
             elenco: Some(elenco),
             prestazioni: vec![],
             slots: alt.slots,
+            perche,
             migliori,
             area_incompleta: alt.area_incompleta,
             solo_proposta: false,
@@ -668,21 +677,27 @@ impl Sessione {
     pub fn controlla_nuova(&mut self, zona: &Zona, cal: &Calendario) -> Result<Controllo, Errore> {
         let alt = self.cerca_nuova(zona.estensioni())?;
         let solo_proposta = self.n_prestazioni > 1;
-        let migliori = alt
+        let perche: Vec<_> = alt
             .slots
             .iter()
-            .filter(|s| candidata(s, None, zona, cal) && (s.proposta || !solo_proposta))
-            .cloned()
+            .map(|s| perche_no(s, None, zona, cal).or((solo_proposta && !s.proposta).then_some(NON_INSIEME)))
             .collect();
+        let migliori = buone(&alt.slots, &perche);
         Ok(Controllo {
             elenco: None,
             prestazioni: self.nomi.clone(),
             slots: alt.slots,
+            perche,
             migliori,
             area_incompleta: alt.area_incompleta,
             solo_proposta,
         })
     }
+}
+
+/// Le date che vanno bene, cioe' senza un perche'.
+fn buone(slots: &[Slot], perche: &[Option<&'static str>]) -> Vec<Slot> {
+    slots.iter().zip(perche).filter(|(_, p)| p.is_none()).map(|(s, _)| s.clone()).collect()
 }
 
 #[cfg(test)]
@@ -873,6 +888,10 @@ mod test {
         assert!(c.slots[4].proposta && !c.area_incompleta);
         // a Torino, non di venerdi', prima del 7 gennaio: la proposta e San Giovanni Bosco
         assert_eq!(sedi(&c.migliori), ["SAN GIOVANNI BOSCO", "MOLINETTE"]);
+        // e per ogni data offerta perche' non va bene: le altre si possono mostrare (e scegliere) lo stesso
+        assert_eq!(c.perche.len(), c.slots.len());
+        assert_eq!((c.perche[0], c.perche[1], c.perche[4]), (None, Some("fuori zona"), None));
+        assert!(c.perche[2..4].iter().all(Option::is_some));
         // le richieste, come il browser: elenco, Sposta, pagina, i due click, un'estensione e la chiusura dell'avviso
         let righe: Vec<&str> = viste.iter().map(|v| v.0.as_str()).collect();
         assert_eq!(
@@ -1167,6 +1186,9 @@ mod test {
         assert_eq!(c.prestazioni, [ECO, "VISITA CARDIOLOGICA"]);
         assert_eq!(c.slots.len(), 2);
         assert!(c.migliori.len() == 1 && c.migliori[0].proposta);
+        // le altre non sono per tutte le prestazioni insieme
+        let insieme: Vec<_> = c.slots.iter().zip(&c.perche).filter(|(s, _)| !s.proposta).map(|(_, p)| *p).collect();
+        assert!(!insieme.is_empty() && insieme.iter().all(|p| *p == Some(NON_INSIEME)));
     }
 
     #[test]

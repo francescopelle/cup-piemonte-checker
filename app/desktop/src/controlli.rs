@@ -11,7 +11,10 @@ use std::time::{Duration, Instant};
 
 use chrono::NaiveDate;
 use cup_core::analisi::breve;
-use cup_core::{Calendario, Controllo, Dove, Errore, Sessione, Slot, Zona};
+use cup_core::distanza::{km_breve, la_piu_vicina};
+use cup_core::portale::NON_INSIEME;
+use cup_core::zona::{NON_PRIMA, NON_SCEGLIBILE};
+use cup_core::{zona, Calendario, Controllo, Criterio, Dove, Errore, Sessione, Slot, Zona};
 use serde::Serialize;
 
 use crate::archivio::{Archivio, Data, Dati, Esito, Ricetta, Visita, NOTIFICATE_MAX};
@@ -154,7 +157,7 @@ pub fn della_prenotazione(dove: &str, valore: &str) -> bool {
     matches!(dove, "sede" | "comune" | "provincia") && valore.trim().is_empty()
 }
 
-/// La zona e i giorni da evitare di una ricetta.
+/// La zona e i giorni da evitare di una ricetta, con la prima data utile.
 pub fn zona_di(r: &Ricetta) -> Result<(Zona, Calendario), Errore> {
     // senza prenotazione una zona "della prenotazione" non vuol dire nulla: finche' non e' prenotata si cerca dove
     // propone il CUP, poi torna a valere la scelta dell'utente
@@ -164,7 +167,12 @@ pub fn zona_di(r: &Ricetta) -> Result<(Zona, Calendario), Errore> {
         Dove::da_scelta(&r.dove, &r.valore)?
     };
     let zona = Zona::new(dove);
-    Ok((zona, Calendario { no_settimana: r.evita.iter().copied().filter(|g| *g < 7).collect(), ..Default::default() }))
+    let cal = Calendario {
+        no_settimana: r.evita.iter().copied().filter(|g| *g < 7).collect(),
+        dal: r.dal(),
+        ..Default::default()
+    };
+    Ok((zona, cal))
 }
 
 /// Un messaggio "Il portale ha risposto: <testo del portale>" senza il testo del portale, che puo' nominare la
@@ -211,7 +219,32 @@ pub struct Notifica {
 }
 
 fn data(s: &Slot) -> Data {
-    Data { chiave: s.chiave(), quando: breve(&s.quando), luogo: s.luogo.to_string(), proposta: s.proposta }
+    Data {
+        chiave: s.chiave(),
+        quando: breve(&s.quando),
+        luogo: s.luogo.to_string(),
+        proposta: s.proposta,
+        comune: zona::comune(&s.luogo),
+        perche: None,
+        sceglibile: true,
+    }
+}
+
+/// Tutte le date offerte, ognuna con il perche' non va bene (senza "non e' prima della prenotazione", che dipende
+/// dalla prenotazione di adesso: vedi `Esito::perche`) e se si puo' scegliere.
+fn tutte(c: &Controllo) -> Vec<Data> {
+    c.slots
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let p = c.perche.get(i).copied().flatten();
+            Data {
+                perche: p.filter(|m| *m != NON_PRIMA).map(String::from),
+                sceglibile: !matches!(p, Some(NON_SCEGLIBILE | NON_INSIEME)),
+                ..data(s)
+            }
+        })
+        .collect()
 }
 
 /// Aggiorna la ricetta con l'esito di un controllo: prenotazione, date buone, errori, pausa. Restituisce le notifiche
@@ -230,19 +263,36 @@ pub fn applica(r: &mut Ricetta, esito: Result<Controllo, Errore>, zona: &Zona, t
             }
             let mut notifiche = vec![];
             if !nuove.is_empty() {
-                let mut righe: Vec<String> =
-                    nuove.iter().take(NOTIFICA_DATE).map(|d| format!("{} · {}", d.quando, d.luogo)).collect();
-                match nuove.len().saturating_sub(NOTIFICA_DATE) {
+                // le distanze dal comune di partenza (o da quello della prenotazione appena letta)
+                let partenza = r.partenza_da(&a.map(|x| zona::comune(&x.luogo)).unwrap_or_default());
+                let km = |d: &Data| partenza.as_ref().and_then(|(_, p)| p.km_da(&d.comune));
+                let riga = |d: &Data| match km(d) {
+                    Some(k) => format!("{} · {} · {}", d.quando, d.luogo, km_breve(k)),
+                    None => format!("{} · {}", d.quando, d.luogo),
+                };
+                let mut righe: Vec<String> = nuove.iter().take(NOTIFICA_DATE).map(|d| riga(d)).collect();
+                // le due scelte: la prima data (qui sopra) e la prima nella sede piu' vicina, se non e' gia' scritta
+                let vicina = la_piu_vicina(nuove.iter().enumerate(), |(_, d)| km(d)).map(|((i, d), _)| (i, *d));
+                let mut scritte = righe.len();
+                if let Some((_, d)) = vicina.filter(|(i, _)| *i >= NOTIFICA_DATE) {
+                    righe.push(format!("La più vicina: {}", riga(d)));
+                    scritte += 1;
+                }
+                match nuove.len().saturating_sub(scritte) {
                     0 => {}
                     1 => righe.push("e un'altra data: la vedi nell'app".into()),
                     n => righe.push(format!("e altre {n} date: le vedi nell'app")),
                 }
-                // senza prenotazione ogni data nella zona va bene: e' un posto libero, non una data "prima"
-                let titolo = match (a.is_some(), nuove.len()) {
-                    (true, 1) => "Data prima",
-                    (true, _) => "Date prima",
-                    (false, 1) => "Posto libero",
-                    (false, _) => "Posti liberi",
+                // senza prenotazione ogni data nella zona va bene: e' un posto libero, non una data "prima". Con la
+                // prenotazione prima della prima data utile (o in un giorno da evitare) vanno bene anche date dopo
+                let prima = a.is_some_and(|a| c.migliori.iter().all(|s| s.quando < a.quando));
+                let titolo = match (a.is_some(), prima, nuove.len()) {
+                    (true, true, 1) => "Data prima",
+                    (true, true, _) => "Date prima",
+                    (true, false, 1) => "Data che va bene",
+                    (true, false, _) => "Date che vanno bene",
+                    (false, _, 1) => "Posto libero",
+                    (false, _, _) => "Posti liberi",
                 };
                 notifiche.push(Notifica {
                     ricetta: r.id,
@@ -267,6 +317,7 @@ pub fn applica(r: &mut Ricetta, esito: Result<Controllo, Errore>, zona: &Zona, t
                 zona: zona.dove.descrizione(a),
                 date: c.slots.len(),
                 buone,
+                tutte: tutte(&c),
                 area_incompleta: c.area_incompleta,
                 errore: None,
                 nota: None,
@@ -288,6 +339,7 @@ pub fn applica(r: &mut Ricetta, esito: Result<Controllo, Errore>, zona: &Zona, t
                 controllo: false,
                 errore: None,
                 buone: vec![],
+                tutte: vec![],
                 date: 0,
                 nota: Some(format!("{m}: al prossimo controllo l'app legge la prenotazione e cerca date prima.")),
                 ..prima
@@ -331,6 +383,7 @@ pub fn applica(r: &mut Ricetta, esito: Result<Controllo, Errore>, zona: &Zona, t
                 controllo: true,
                 errore: Some(e.to_string()),
                 buone: vec![],
+                tutte: vec![],
                 date: 0,
                 nota: None,
                 ..prima
@@ -351,24 +404,36 @@ pub fn applica(r: &mut Ricetta, esito: Result<Controllo, Errore>, zona: &Zona, t
     }
 }
 
-/// La data da prenotare da sola dopo un controllo, se la ricetta ha la prenotazione automatica accesa: la piu'
-/// vicina tra quelle buone, con una sede, mai per oggi e mai una gia' tentata.
+/// La data da prenotare da sola dopo un controllo, se la ricetta ha la prenotazione automatica accesa: tra quelle
+/// buone, con una sede, mai per oggi e mai una gia' tentata, la prima (preferenza "data") o la prima nella sede piu'
+/// vicina al comune di partenza (preferenza "distanza"; se non si sa la distanza di nessuna, la prima).
 pub fn da_sola(r: &Ricetta, c: &Controllo, oggi: NaiveDate) -> Option<String> {
     if !r.automatica || !r.attiva || r.incerta.is_some() || r.operazione.is_some() {
         return None;
     }
-    c.migliori
+    let mut possibili = c
+        .migliori
         .iter()
-        .filter(|s| !s.luogo.sede.trim().is_empty() && s.quando.date() > oggi)
-        .map(Slot::chiave)
-        .find(|k| !r.tentate.contains(k))
+        .filter(|s| !s.luogo.sede.trim().is_empty() && s.quando.date() > oggi && !r.tentate.contains(&s.chiave()));
+    let scelta = match r.criterio() {
+        Criterio::Data => possibili.next(),
+        Criterio::Distanza => {
+            let attuale = c.elenco.as_ref().map(|e| zona::comune(&e.attuale.luogo)).unwrap_or_default();
+            let partenza = r.partenza_da(&attuale).map(|(_, p)| p);
+            let possibili: Vec<&Slot> = possibili.collect();
+            let km = |s: &&Slot| partenza.and_then(|p| p.km_da(&zona::comune(&s.luogo)));
+            la_piu_vicina(possibili.iter().copied(), km).map(|(s, _)| s).or(possibili.first().copied())
+        }
+    };
+    scelta.map(Slot::chiave)
 }
 
-pub type Impostazioni = (String, String, String, String, Vec<u32>);
+pub type Impostazioni = (String, String, String, String, Vec<u32>, String);
 
-/// Le impostazioni da cui dipende un controllo: se cambiano mentre e' in corso, il suo esito non vale piu'.
+/// Le impostazioni da cui dipende un controllo: se cambiano mentre e' in corso, il suo esito non vale piu'. (La
+/// preferenza e il comune di partenza no: cambiano solo l'ordine delle date, che si calcola quando serve.)
 pub fn impostazioni(r: &Ricetta) -> Impostazioni {
-    (r.cf.clone(), r.nre.clone(), r.dove.clone(), r.valore.clone(), r.evita.clone())
+    (r.cf.clone(), r.nre.clone(), r.dove.clone(), r.valore.clone(), r.evita.clone(), r.dal.clone())
 }
 
 /// L'esito di un controllo e la sua sessione (con "Sposta" aperto), se c'e'.
@@ -599,6 +664,9 @@ mod test {
             cellulare: None,
             automatica: false,
             tentate: vec![],
+            dal: String::new(),
+            partenza: String::new(),
+            criterio: String::new(),
         }
     }
 
@@ -630,6 +698,7 @@ mod test {
                 riga: 0,
             }),
             prestazioni: vec![],
+            perche: vec![None; migliori.len()],
             slots: migliori.clone(),
             migliori,
             area_incompleta: false,
@@ -679,9 +748,11 @@ mod test {
         let n = applica(&mut r, Ok(controllo(vec![slot(1, "MAURIZIANO"), slot(2, "CTO")])), &zona, 50);
         assert_eq!(n.len(), 1);
         assert_eq!(n[0].titolo, "Date prima per Genetica");
+        // con la distanza dal comune della prenotazione (le Molinette, a Torino)
         assert_eq!(
             n[0].testo,
-            "mar 01/12/2026 ore 09:00 · MAURIZIANO, AMB, TORINO (TO)\nmer 02/12/2026 ore 09:00 · CTO, AMB, TORINO (TO)"
+            "mar 01/12/2026 ore 09:00 · MAURIZIANO, AMB, TORINO (TO) · stesso comune\n\
+             mer 02/12/2026 ore 09:00 · CTO, AMB, TORINO (TO) · stesso comune"
         );
         let e = r.esito.clone().unwrap();
         assert_eq!((e.ts, e.date, e.buone.len(), e.zona.as_str()), (50, 2, 2, "solo nel comune di Torino"));
@@ -691,7 +762,7 @@ mod test {
         let n = applica(&mut r, Ok(controllo(vec![slot(1, "MAURIZIANO"), slot(3, "OFTALMICO")])), &zona, 70);
         assert_eq!(
             (n[0].titolo.as_str(), n[0].testo.as_str()),
-            ("Data prima per Genetica", "gio 03/12/2026 ore 09:00 · OFTALMICO, AMB, TORINO (TO)")
+            ("Data prima per Genetica", "gio 03/12/2026 ore 09:00 · OFTALMICO, AMB, TORINO (TO) · stesso comune")
         );
         // tante date nuove: le prime tre per intero; la stessa data due volte conta una volta
         let molte = vec![slot(10, "A"), slot(10, "A"), slot(11, "B"), slot(12, "C"), slot(13, "D"), slot(14, "E")];
@@ -705,6 +776,95 @@ mod test {
         applica(&mut r, Ok(controllo(vec![slot(4, "NUOVO")])), &zona, 90);
         assert_eq!(r.notificate.len(), NOTIFICATE_MAX);
         assert_eq!(r.notificate.last().unwrap(), &slot(4, "NUOVO").chiave());
+    }
+
+    /// Una data in una sede di un altro comune.
+    fn slot_a(g: u32, sede: &str, indirizzo: &str) -> Slot {
+        let mut s = slot(g, sede);
+        s.luogo.indirizzo = indirizzo.into();
+        s
+    }
+
+    #[test]
+    fn notifica_con_la_prima_e_la_piu_vicina() {
+        let mut r = ricetta();
+        r.dove = "tutte".into();
+        let zona = zona_di(&r).unwrap().0;
+        // quattro date ad Asti e poi una a Torino, il comune della prenotazione: le prime tre e la piu' vicina
+        let mut date: Vec<Slot> =
+            (1..=4).map(|g| slot_a(g, "CARDINAL MASSAIA", "Corso Dante 202 - ASTI (AT)")).collect();
+        date.push(slot(5, "MAURIZIANO"));
+        let n = applica(&mut r, Ok(controllo(date)), &zona, 10);
+        let righe: Vec<&str> = n[0].testo.lines().collect();
+        assert_eq!(righe.len(), 5, "{righe:?}");
+        let asti = "mar 01/12/2026 ore 09:00 · CARDINAL MASSAIA, AMB, Corso Dante 202 - ASTI (AT) · ";
+        assert!(righe[0].starts_with(asti) && righe[0].ends_with(" km"), "{}", righe[0]);
+        assert_eq!(righe[3], "La più vicina: sab 05/12/2026 ore 09:00 · MAURIZIANO, AMB, TORINO (TO) · stesso comune");
+        assert_eq!(righe[4], "e un'altra data: la vedi nell'app");
+        // il comune di partenza scelto dall'utente vale prima di quello della prenotazione: da Asti la piu' vicina e'
+        // gia' tra le prime tre
+        let mut r = ricetta();
+        (r.dove, r.partenza) = ("tutte".into(), "ASTI".into());
+        let mut date: Vec<Slot> =
+            (1..=4).map(|g| slot_a(g, "CARDINAL MASSAIA", "Corso Dante 202 - ASTI (AT)")).collect();
+        date.push(slot(5, "MAURIZIANO"));
+        let n = applica(&mut r, Ok(controllo(date)), &zona, 10);
+        let righe: Vec<&str> = n[0].testo.lines().collect();
+        assert!(righe[0].ends_with("ASTI (AT) · stesso comune") && righe[3] == "e altre 2 date: le vedi nell'app");
+        // le date buone ricordano il comune della sede, per le distanze nell'app
+        assert_eq!(r.esito.unwrap().buone[4].comune, "TORINO");
+    }
+
+    #[test]
+    fn tutte_le_date_offerte_con_il_perche() {
+        let mut r = ricetta();
+        let zona = zona_di(&r).unwrap().0;
+        let mut senza = slot(3, "SENZA");
+        senza.seleziona = None;
+        let tardi = Slot { quando: quando(31, 12), ..slot(31, "TARDI") }; // dopo la prenotazione (31/12 ore 11)
+        let mut c = controllo(vec![slot(1, "MAURIZIANO")]);
+        c.slots = vec![slot(1, "MAURIZIANO"), slot_a(2, "OSPEDALE", "- ASTI (AT)"), senza, tardi];
+        c.perche = vec![None, Some("fuori zona"), Some(NON_SCEGLIBILE), Some(NON_PRIMA)];
+        applica(&mut r, Ok(c), &zona, 10);
+        let e = r.esito.clone().unwrap();
+        let perche: Vec<Option<&str>> = e.tutte.iter().map(|d| d.perche.as_deref()).collect();
+        // "non e' prima" non si scrive: dipende dalla prenotazione di adesso, che puo' cambiare
+        assert_eq!(perche, [None, Some("fuori zona"), Some(NON_SCEGLIBILE), None]);
+        assert_eq!(e.tutte.iter().map(|d| d.sceglibile).collect::<Vec<_>>(), [true, true, false, true]);
+        assert_eq!(e.perche(&e.tutte[3]).as_deref(), Some(NON_PRIMA));
+        assert_eq!((e.buone.len(), e.date, e.tutte[1].comune.as_str()), (1, 4, "ASTI"));
+        // una ricetta mai prenotata con piu' prestazioni: le date non proposte non si scelgono
+        let mut c = controllo(vec![]);
+        (c.elenco, c.slots, c.perche) = (None, vec![slot(4, "A")], vec![Some(NON_INSIEME)]);
+        applica(&mut r, Ok(c), &zona, 15);
+        assert!(!r.esito.as_ref().unwrap().tutte[0].sceglibile);
+        // un errore: le date di prima non valgono piu'
+        applica(&mut r, Err(Errore::Timeout), &zona, 20);
+        assert!(r.esito.unwrap().tutte.is_empty());
+    }
+
+    #[test]
+    fn prima_data_utile_nel_calendario_e_nelle_impostazioni() {
+        let mut r = ricetta();
+        assert_eq!(zona_di(&r).unwrap().1.dal, None);
+        let prima = impostazioni(&r);
+        r.dal = "2026-12-15".into();
+        assert_eq!(zona_di(&r).unwrap().1.dal, chrono::NaiveDate::from_ymd_opt(2026, 12, 15));
+        // cambiarla cambia le date buone: l'esito di un controllo in corso non vale piu'
+        assert_ne!(impostazioni(&r), prima);
+        // la preferenza e il comune di partenza no: cambiano solo l'ordine
+        let con_dal = impostazioni(&r);
+        (r.criterio, r.partenza) = ("distanza".into(), "ASTI".into());
+        assert_eq!(impostazioni(&r), con_dal);
+        // con la prenotazione prima della prima data utile vanno bene anche date dopo: il titolo non dice "prima"
+        let zona = zona_di(&r).unwrap().0;
+        let mut c = controllo(vec![]);
+        let dopo = slot(1, "MAURIZIANO");
+        c.elenco.as_mut().unwrap().attuale.quando = quando(1, 8);
+        c.migliori = vec![dopo.clone()];
+        c.slots = vec![dopo];
+        let n = applica(&mut r, Ok(c), &zona, 10);
+        assert_eq!(n[0].titolo, "Data che va bene per Genetica");
     }
 
     #[test]
@@ -875,6 +1035,44 @@ mod test {
         assert_eq!(da_sola(&r, &c, oggi), Some(slot(5, "MAURIZIANO").chiave()));
         r.tentate.push(slot(5, "MAURIZIANO").chiave());
         assert_eq!(da_sola(&r, &c, oggi), None);
+    }
+
+    #[test]
+    fn prenotazione_automatica_nella_sede_piu_vicina() {
+        let mut r = ricetta();
+        (r.automatica, r.criterio) = (true, "distanza".into());
+        let ignota = slot_a(2, "SEDE", "VIA X - ()"); // il comune non si legge
+        let asti = slot_a(3, "CARDINAL MASSAIA", "Corso Dante 202 - ASTI (AT)");
+        let moncalieri = slot_a(4, "SANTA CROCE", "Piazza Amedeo Ferdinando 3 - MONCALIERI (TO)");
+        let torino = slot_a(5, "MAURIZIANO", "Largo Turati 62 - TORINO (TO)");
+        let torino_dopo = slot(6, "CTO");
+        let c = controllo(vec![ignota.clone(), asti.clone(), moncalieri.clone(), torino.clone(), torino_dopo.clone()]);
+        let oggi = quando(1, 0).date();
+        // dal comune della prenotazione (Torino): la prima data a Torino, anche se Asti e Moncalieri vengono prima
+        assert_eq!(da_sola(&r, &c, oggi), Some(torino.chiave()));
+        // ogni data una volta sola: poi l'altra a Torino, poi Moncalieri (~8 km), poi Asti (~46 km)
+        r.tentate = vec![torino.chiave()];
+        assert_eq!(da_sola(&r, &c, oggi), Some(torino_dopo.chiave()));
+        r.tentate.push(torino_dopo.chiave());
+        assert_eq!(da_sola(&r, &c, oggi), Some(moncalieri.chiave()));
+        r.tentate.push(moncalieri.chiave());
+        assert_eq!(da_sola(&r, &c, oggi), Some(asti.chiave()));
+        // quella di cui non si sa la distanza per ultima
+        r.tentate.push(asti.chiave());
+        assert_eq!(da_sola(&r, &c, oggi), Some(ignota.chiave()));
+        // dal comune scelto dall'utente
+        (r.tentate, r.partenza) = (vec![], "Asti".into());
+        assert_eq!(da_sola(&r, &c, oggi), Some(asti.chiave()));
+        // mai per oggi, anche se e' la piu' vicina: da Asti allora Moncalieri (~42 km), prima di Torino (~46 km)
+        assert_eq!(da_sola(&r, &c, quando(3, 0).date()), Some(moncalieri.chiave()));
+        // per data: la prima, dove che sia
+        r.criterio = "data".into();
+        assert_eq!(da_sola(&r, &c, oggi), Some(ignota.chiave()));
+        // per distanza ma senza un comune da cui misurare (mai prenotata, nessun comune di partenza): la prima
+        (r.criterio, r.partenza) = ("distanza".into(), String::new());
+        let mut nuova = c.clone();
+        nuova.elenco = None;
+        assert_eq!(da_sola(&r, &nuova, oggi), Some(ignota.chiave()));
     }
 
     #[test]

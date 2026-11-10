@@ -14,6 +14,10 @@ let daEliminare = { id: null, fino: 0 };
 let daConfermare = null;
 // le operazioni partite da questa finestra, finche' il portale non risponde (contro il doppio click)
 const inViaggio = new Set();
+// le ricette con "Tutte le date trovate" aperto, e l'ordine scelto per ciascuna ("data" o "distanza"): le schede si
+// ridisegnano spesso, l'elenco resta com'era
+const aperte = new Set();
+const ordine = new Map();
 const IN_CORSO = {
   controllo: "🔄 Controllo in corso… può volerci qualche minuto.",
   spostamento: "🔄 Spostamento in corso: dopo la conferma l'app controlla sul portale che sia andato. Può volerci " +
@@ -87,7 +91,9 @@ function riepilogo(r) {
   if (e.errore) return el("p", "stato errore", `⚠️ Controllo delle ${e.ora}: ${e.errore}`);
   const buone = e.buone.length;
   const offerte = e.date === 1 ? "1 data offerta" : `${e.date} date offerte`;
-  const nessuna = r.nuova ? "nessuna nella zona e nei giorni scelti." : "nessuna prima della prenotazione.";
+  // con una prima data utile vanno bene anche date dopo la prenotazione, se la prenotazione e' prima di quel giorno
+  const nessuna = r.nuova ? "nessuna nella zona e nei giorni scelti."
+    : r.dal ? "nessuna che va bene." : "nessuna prima della prenotazione.";
   return el("p", buone ? "stato buone" : "stato",
     `Controllo delle ${e.ora}: ${offerte}, ` + (buone ? (buone === 1 ? "1 va bene." : `${buone} vanno bene.`) : nessuna));
 }
@@ -108,19 +114,35 @@ async function operazione(comando, argomenti, id) {
   }
 }
 
+// una data scelta che non rispetta le scelte dell'utente: lo si dice prima di toccare il portale
+function avvertenze(r, d) {
+  if (!d.stato) return [];
+  const righe = [el("p", "errore", `⚠️ Questa data non rispetta quello che hai scelto: ${d.stato}.`)];
+  if (d.stato === "non è prima della prenotazione") {
+    righe.push(el("p", "nota", "È più tardi della prenotazione attuale, che si libera: poi potrebbe non tornare."));
+  }
+  if (r.automatica) {
+    righe.push(el("p", "nota", "La prenotazione automatica si spegne, se no la sposterebbe di nuovo su una data che " +
+      "va bene."));
+  }
+  return righe;
+}
+
 // il riquadro "Sei sicuro?" di uno spostamento o di una disdetta: data, ora e luogo, prima di toccare il portale
 function riquadroConferma(r, a) {
   const c = daConfermare;
   const box = el("div", "conferma");
   if (c.tipo === "sposta") {
-    box.append(el("p", "titolo", "Spostare la prenotazione?"),
+    box.append(el("p", "titolo", c.data.stato ? "Sostituire la prenotazione?" : "Spostare la prenotazione?"),
       el("p", "", "Da: " + (a ? `${a.quando} · ${a.luogo}` : "la prenotazione attuale")),
-      el("p", "quando", `A: ${c.data.quando} · ${c.data.luogo}`),
+      el("p", "quando", `A: ${c.data.quando} · ${c.data.luogo}` + (c.data.distanza ? ` · ${c.data.distanza}` : "")),
+      ...avvertenze(r, c.data),
       el("p", "nota", "L'app conferma sul portale e poi controlla che lo spostamento sia andato. La data attuale " +
         "viene liberata."));
   } else if (c.tipo === "prenota") {
     box.append(el("p", "titolo", "Prenotare questa data?"),
-      el("p", "quando", `${c.data.quando} · ${c.data.luogo}`));
+      el("p", "quando", `${c.data.quando} · ${c.data.luogo}` + (c.data.distanza ? ` · ${c.data.distanza}` : "")),
+      ...avvertenze(r, c.data));
     if (r.esito && r.esito.cosa) box.append(el("p", "", "Per: " + r.esito.cosa));
     box.append(el("p", "nota", "L'app conferma sul portale e poi controlla che la prenotazione risulti. Dopo cerca " +
       "date prima, e se non ti va più bene puoi disdirla con \"Disdici\"."));
@@ -137,6 +159,85 @@ function riquadroConferma(r, a) {
         () => operazione(c.tipo, { id: r.id, chiave: c.data.chiave }, r.id)));
   box.append(bottoni);
   return box;
+}
+
+// una data trovata: data, ora, luogo, distanza, (nell'elenco di tutte) se va bene, e "Sposta qui" o "Prenota qui"
+function voce(r, d, etichetta, libera, stato = false) {
+  const li = el("li", d.stato ? "altra" : "buona");
+  if (etichetta) li.append(el("span", "etichetta", etichetta));
+  li.append(el("span", "quando", d.quando + (d.proposta ? " · proposta" : "")), el("span", "dove", d.luogo));
+  if (d.distanza) li.append(el("span", "km", "📍 " + d.distanza));
+  if (stato) li.append(el("span", "stato-data", d.stato ? "✗ " + d.stato : "✓ va bene"));
+  if (libera && d.sceglibile) {
+    li.append(pulsante(r.nuova ? "Prenota qui" : "Sposta qui", "secondario", () => {
+      daConfermare = { id: r.id, tipo: r.nuova ? "prenota" : "sposta", data: d };
+      carica();
+    }));
+  }
+  return li;
+}
+
+// le date buone: in cima le due scelte, la prima data e quella nella sede piu' vicina
+function dateBuone(r, libera) {
+  const e = r.esito;
+  const perChiave = new Map(e.buone.map((d) => [d.chiave, d]));
+  const prima = perChiave.get(e.prima);
+  const vicina = perChiave.get(e.vicina);
+  const scelte = el("ul", "date");
+  if (prima) {
+    scelte.append(voce(r, prima, vicina === prima ? "⏱📍 La prima, ed è anche la più vicina" : "⏱ La prima", libera));
+  }
+  if (vicina && vicina !== prima) scelte.append(voce(r, vicina, "📍 La più vicina", libera));
+  return [scelte, el("p", "nota", r.distanze_da
+    ? `Distanze in linea d'aria da ${r.distanze_da}.`
+    : "Per vedere anche la data nella sede più vicina scrivi in «Modifica» il comune da cui parti.")];
+}
+
+// tutte le date trovate dall'ultimo controllo, anche quelle che non vanno bene (con il perche'): ognuna si puo'
+// scegliere e sostituisce la prenotazione, anche dopo che l'app ha gia' spostato o prenotato. In fila per data o per
+// distanza. Le ricette salvate prima della 0.4.0 hanno solo le date buone
+function tutteLeDate(r, libera) {
+  const e = r.esito;
+  const tutte = e.tutte.length ? e.tutte : e.buone;
+  const box = el("details", "tutte");
+  box.open = aperte.has(r.id);
+  box.addEventListener("toggle", () => { if (box.open) aperte.add(r.id); else aperte.delete(r.id); });
+  box.append(el("summary", "", e.tutte.length
+    ? `Tutte le date trovate dall'ultimo controllo (${tutte.length})`
+    : `Le date che vanno bene (${tutte.length})`));
+  const perDistanza = ordine.get(r.id) === "distanza" && e.per_distanza.length;
+  if (e.per_distanza.length) {
+    const scelta = el("div", "ordine");
+    const bottone = (testo, valore) => {
+      const b = pulsante(testo, "secondario" + ((ordine.get(r.id) || "data") === valore ? " scelto" : ""), () => {
+        ordine.set(r.id, valore);
+        carica();
+      });
+      b.setAttribute("aria-pressed", String((ordine.get(r.id) || "data") === valore));
+      return b;
+    };
+    scelta.append(el("span", "nota", "In fila:"), bottone("⏱ per data", "data"), bottone("📍 per distanza", "distanza"));
+    box.append(scelta);
+  }
+  const perChiave = new Map(tutte.map((d) => [d.chiave, d]));
+  const fila = perDistanza ? e.per_distanza.map((k) => perChiave.get(k)).filter(Boolean) : tutte;
+  const lista = el("ul", "date");
+  for (const d of fila) lista.append(voce(r, d, "", libera, true));
+  box.append(lista);
+  if (e.tutte.length) {
+    box.append(el("p", "nota", r.nuova
+      ? "Puoi prenotare anche una data che non va bene: l'app ti dice prima perché."
+      : "Puoi sostituire la prenotazione con una qualsiasi di queste, anche più tardi o fuori dalla zona: l'app ti " +
+        "dice prima perché non va bene."));
+  }
+  return box;
+}
+
+// quale data prende la prenotazione automatica, per la scheda
+function sceltaAutomatica(r) {
+  if (r.criterio !== "distanza") return " (la prima)";
+  if (r.distanze_da) return ` (nella sede più vicina a ${r.distanze_da})`;
+  return " (la sede più vicina: scrivi in «Modifica» il comune da cui parti; finché non c'è, la prima)";
 }
 
 function scheda(r) {
@@ -161,9 +262,9 @@ function scheda(r) {
   s.append(el("p", "nota", `🔎 Cerco ${r.zona} · ${r.giorni}`));
   // in pausa o con un esito da controllare non parte niente: allora non la si mostra
   if (r.automatica && r.attiva && !r.incerta) {
-    s.append(el("p", "nota automatica", r.nuova
-      ? "⚡ Prenotazione automatica: il primo posto libero che va bene lo prenoto da sola"
-      : "⚡ Prenotazione automatica: una data prima che va bene la prenoto da sola"));
+    s.append(el("p", "nota automatica", (r.nuova
+      ? "⚡ Prenotazione automatica: un posto libero che va bene lo prenoto da sola"
+      : "⚡ Prenotazione automatica: una data che va bene la prenoto da sola") + sceltaAutomatica(r)));
   }
   s.append(riepilogo(r));
   const libera = !r.in_corso && !r.incerta && !inViaggio.has(r.id);
@@ -174,19 +275,7 @@ function scheda(r) {
     s.append(note);
   }
   if (r.esito && r.esito.buone.length && !r.in_corso) {
-    const lista = el("ul", "date");
-    for (const d of r.esito.buone) {
-      const li = el("li", "buona");
-      li.append(el("span", "quando", d.quando + (d.proposta ? " · proposta" : "")), el("span", "dove", d.luogo));
-      if (libera) {
-        li.append(pulsante(r.nuova ? "Prenota qui" : "Sposta qui", "secondario", () => {
-          daConfermare = { id: r.id, tipo: r.nuova ? "prenota" : "sposta", data: d };
-          carica();
-        }));
-      }
-      lista.append(li);
-    }
-    s.append(lista, el("p", "nota", r.nuova
+    s.append(...dateBuone(r, libera), el("p", "nota", r.nuova
       ? "Puoi prenotare qui con \"Prenota qui\", o dal sito del CUP Piemonte o al call center 800 000 500." +
         (r.automatica ? "" : " L'app non prenota mai nulla da sola.")
       : "Puoi spostarla qui con \"Sposta qui\", o dal sito del CUP Piemonte o al call center 800 000 500." +
@@ -196,11 +285,23 @@ function scheda(r) {
         "per tutte insieme."));
     }
   }
+  // dopo uno spostamento o una prenotazione le buone si svuotano, ma le altre date trovate restano: per cambiarla
+  // (nelle ricette salvate prima della 0.4.0 ci sono solo le buone: l'elenco serve se non sono tutte gia' in cima)
+  const nascoste = r.esito && r.esito.buone.some((d) => d.chiave !== r.esito.prima && d.chiave !== r.esito.vicina);
+  const elenco = r.esito && (r.esito.tutte.length || nascoste);
+  if (elenco && !r.in_corso) {
+    if (!r.esito.buone.length && r.esito.nota) {
+      s.append(el("p", "nota", "Preferisci un'altra data? In «Tutte le date trovate» puoi sostituire la prenotazione " +
+        "con una di quelle trovate dal controllo."));
+    }
+    s.append(tutteLeDate(r, libera));
+  }
   // il riquadro solo finche' la data e' ancora tra quelle trovate (un controllo puo' averle cambiate)
   const c = daConfermare;
   const valida = c && c.id === r.id && (c.tipo === "disdici"
     ? a && a.iso
-    : (c.tipo === "prenota") === r.nuova && r.esito && r.esito.buone.some((d) => d.chiave === c.data.chiave));
+    : (c.tipo === "prenota") === r.nuova && r.esito &&
+      r.esito.buone.concat(r.esito.tutte).some((d) => d.chiave === c.data.chiave));
   if (valida && libera) s.append(riquadroConferma(r, a));
   if (r.esito && r.esito.area_incompleta) {
     s.append(el("p", "nota", "\"Estendi area\" non ha risposto in tempo: le date più lontane potrebbero mancare."));
@@ -345,8 +446,12 @@ function apri(r) {
     modulo.valore.value = valore;
     for (const c of modulo.querySelectorAll("input[name=evita]")) c.checked = r.evita.includes(Number(c.value));
     modulo.automatica.checked = automaticaPrima = r.automatica;
+    modulo.criterio.value = r.criterio;
+    modulo.dal.value = r.dal;
+    modulo.partenza.value = r.partenza;
   }
   modulo.valore.hidden = modulo.dove.value !== "altro";
+  $("criterio").hidden = !modulo.automatica.checked;
   modulo.hidden = false;
   $("nuova").hidden = true;
   modulo.nome.focus();
@@ -357,6 +462,10 @@ function chiudi() {
   $("nuova").hidden = false;
   modifica = null;
 }
+
+// la preferenza vale solo per la prenotazione automatica: senza, l'app mostra la prima data e la piu' vicina
+modulo.automatica.addEventListener("change", () => { $("criterio").hidden = !modulo.automatica.checked; });
+$("togli-dal").addEventListener("click", () => { modulo.dal.value = ""; });
 
 modulo.dove.addEventListener("change", () => {
   modulo.valore.hidden = modulo.dove.value !== "altro";
@@ -376,14 +485,16 @@ modulo.addEventListener("submit", async (ev) => {
   // controllati dall'app (formato, cellulare italiano): un errore torna come messaggio
   const contatti = { email: modulo.email.value, cellulare: modulo.cellulare.value };
   const automatica = modulo.automatica.checked;
+  // la prima data utile ("2027-01-10" dal calendario, o scritta a mano) e il comune di partenza: controllati dall'app
+  const preferenze = { criterio: modulo.criterio.value || "data", dal: modulo.dal.value, partenza: modulo.partenza.value };
   const salva = $("salva");
   salva.disabled = true;
   if (modifica === null) avvisa("Leggo la prenotazione dal portale… può volerci un minuto.", false);
   const ok = modifica === null
     ? await esegui("aggiungi", { nome: modulo.nome.value, cf: modulo.cf.value, nre: modulo.nre.value, ...comune, evita,
-                                 attiva: modulo.attiva.checked, ...contatti, automatica })
+                                 attiva: modulo.attiva.checked, ...contatti, automatica, ...preferenze })
     : await esegui("modifica", { id: modifica, nome: modulo.nome.value, ...comune, evita, ...contatti, automatica,
-                                 automaticaPrima },
+                                 automaticaPrima, ...preferenze },
                    "Modifiche salvate.");
   salva.disabled = false;
   if (ok) chiudi();
