@@ -202,7 +202,9 @@ function tutteLeDate(r, libera) {
   const box = el("details", "tutte");
   box.open = aperte.has(r.id);
   box.addEventListener("toggle", () => { if (box.open) aperte.add(r.id); else aperte.delete(r.id); });
-  box.append(el("summary", "", `Tutte le date trovate dall'ultimo controllo (${tutte.length})`));
+  box.append(el("summary", "", e.tutte.length
+    ? `Tutte le date trovate dall'ultimo controllo (${tutte.length})`
+    : `Le date che vanno bene (${tutte.length})`));
   const perDistanza = ordine.get(r.id) === "distanza" && e.per_distanza.length;
   if (e.per_distanza.length) {
     const scelta = el("div", "ordine");
@@ -284,7 +286,9 @@ function scheda(r) {
     }
   }
   // dopo uno spostamento o una prenotazione le buone si svuotano, ma le altre date trovate restano: per cambiarla
-  const elenco = r.esito && (r.esito.tutte.length || r.esito.buone.length > 2);
+  // (nelle ricette salvate prima della 0.4.0 ci sono solo le buone: l'elenco serve se non sono tutte gia' in cima)
+  const nascoste = r.esito && r.esito.buone.some((d) => d.chiave !== r.esito.prima && d.chiave !== r.esito.vicina);
+  const elenco = r.esito && (r.esito.tutte.length || nascoste);
   if (elenco && !r.in_corso) {
     if (!r.esito.buone.length && r.esito.nota) {
       s.append(el("p", "nota", "Preferisci un'altra data? In «Tutte le date trovate» puoi sostituire la prenotazione " +
