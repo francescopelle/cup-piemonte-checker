@@ -1,5 +1,9 @@
 # App Android: analisi di fattibilità
 
+> **Aggiornamento.** Dopo questa analisi sono state prese decisioni diverse su alcuni punti: l'app si scrive in
+> Kotlin Multiplatform sopra il motore Rust (non con Tauri) e il codice sta nella cartella `android/`. Vale il
+> [piano di sviluppo](PIANO.md); questo documento resta come motivazione e per le verifiche fatte sul codice.
+
 Novembre 2026, sulla versione 0.3.2 dell'app desktop. Obiettivo: un'app per Android distribuita come **APK da
 scaricare e installare** (niente Play Store per ora), con le stesse funzioni dell'app per il computer.
 
