@@ -140,3 +140,13 @@ ul.date li button { justify-self: start; margin-top: 4px; padding: 5px 10px; fon
 .conferma .pulsanti button { padding: 7px 10px; }
 details.note summary { font-size: 0.85rem; color: var(--tenue); }
 .nota.automatica { color: var(--accento); font-weight: 600; }
+
+/* le due scelte: la prima data e quella nella sede piu' vicina */
+ul.date .etichetta { font-size: 0.75rem; font-weight: 700; color: var(--accento); }
+ul.date .km { font-size: 0.85rem; color: var(--tenue); }
+details.tutte summary { font-size: 0.85rem; color: var(--tenue); }
+.scelta { display: grid; gap: 4px; padding-left: 4px; }
+.in-riga { display: flex; gap: 8px; align-items: center; }
+.in-riga input { flex: 1; }
+.in-riga button { padding: 6px 10px; font-size: 0.85rem; }
+input[type=radio] { padding: 0; margin: 0; }

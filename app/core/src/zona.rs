@@ -41,9 +41,11 @@ pub fn chiave_comune(nome: &str) -> String {
 struct Comune {
     nome: String,
     provincia: String,
+    /// Latitudine e longitudine del centro, in gradi (per la distanza delle sedi, vedi `distanza`).
+    centro: Option<(f64, f64)>,
 }
 
-/// I comuni del Piemonte (ISTAT), per chiave: nome maiuscolo e sigla della provincia.
+/// I comuni del Piemonte (ISTAT), per chiave: nome maiuscolo, sigla della provincia e coordinate del centro.
 static COMUNI: LazyLock<HashMap<String, Comune>> = LazyLock::new(|| {
     include_str!("../data/comuni_piemonte.txt")
         .lines()
@@ -51,10 +53,31 @@ static COMUNI: LazyLock<HashMap<String, Comune>> = LazyLock::new(|| {
         .filter_map(|r| {
             let mut c = r.split(';');
             let (nome, provincia) = (c.next()?, c.next()?);
-            Some((chiave_comune(nome), Comune { nome: nome.to_uppercase(), provincia: provincia.into() }))
+            let centro = match (c.next().map(str::parse::<f64>), c.next().map(str::parse::<f64>)) {
+                (Some(Ok(lat)), Some(Ok(lon))) => Some((lat, lon)),
+                _ => None,
+            };
+            Some((chiave_comune(nome), Comune { nome: nome.to_uppercase(), provincia: provincia.into(), centro }))
         })
         .collect()
 });
+
+/// Latitudine e longitudine (gradi) del centro di un comune del Piemonte, scritto come si vuole ("mondovi",
+/// "MONDOVI'"). None se non e' un comune del Piemonte.
+pub fn centro(nome: &str) -> Option<(f64, f64)> {
+    COMUNI.get(&chiave_comune(nome)).and_then(|c| c.centro)
+}
+
+/// "SAN MAURO TORINESE" -> "San Mauro Torinese": un nome di comune da mostrare.
+pub fn titolo(s: &str) -> String {
+    s.split(' ')
+        .map(|p| {
+            let mut c = p.chars();
+            c.next().map_or(String::new(), |f| f.to_uppercase().chain(c.flat_map(char::to_lowercase)).collect())
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 static FINE_INDIRIZZO: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"([^()]*?)\s*\([A-Z]{2}\)\s*$").unwrap());
 static PROVINCIA: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\(([A-Z]{2})\)\s*$").unwrap());
@@ -199,27 +222,38 @@ pub struct Calendario {
     pub no_fino: Option<NaiveDate>,
     /// Dopo questo giorno, tutti no.
     pub si_fino: Option<NaiveDate>,
+    /// La prima data utile scelta dall'utente: i giorni prima sono tutti no, questo giorno compreso va bene.
+    pub dal: Option<NaiveDate>,
 }
 
 impl Calendario {
     pub fn giorno_si(&self, d: NaiveDate) -> bool {
-        if self.no_fino.is_some_and(|f| d <= f) || self.si_fino.is_some_and(|f| d > f) {
+        if self.prima_del_dal(d) || self.no_fino.is_some_and(|f| d <= f) || self.si_fino.is_some_and(|f| d > f) {
             return false;
         }
         !self.no_settimana.contains(&d.weekday().num_days_from_monday()) && !self.no.contains(&d)
+    }
+
+    /// Il giorno e' prima della prima data utile?
+    pub fn prima_del_dal(&self, d: NaiveDate) -> bool {
+        self.dal.is_some_and(|dal| d < dal)
     }
 }
 
 /// Perche' una data non va bene, o None se va bene. La regola unica delle date da proporre: prenotabile, nella
 /// zona, in un giorno si' e prima della prenotazione. Se la prenotazione e' in un giorno no va bene anche una data
-/// piu' tardi (dopo lo spostamento e' in un giorno si': niente spostamenti a catena). Senza prenotazione ogni
-/// giorno si' va bene.
+/// piu' tardi (dopo lo spostamento e' in un giorno si': niente spostamenti a catena). Vale anche per una prenotazione
+/// prima della prima data utile: da li' in poi va bene anche dopo la prenotazione. Senza prenotazione ogni giorno si'
+/// va bene.
 pub fn perche_no(slot: &Slot, attuale: Option<&Prenotazione>, zona: &Zona, cal: &Calendario) -> Option<&'static str> {
     if !(slot.proposta || slot.seleziona.is_some()) {
         return Some("non si può scegliere");
     }
     if !zona.ammette(slot, attuale) {
         return Some("fuori zona");
+    }
+    if cal.prima_del_dal(slot.quando.date()) {
+        return Some("prima della prima data utile");
     }
     if !cal.giorno_si(slot.quando.date()) {
         return Some("giorno da evitare");
@@ -230,6 +264,19 @@ pub fn perche_no(slot: &Slot, attuale: Option<&Prenotazione>, zona: &Zona, cal: 
 
 pub fn candidata(slot: &Slot, attuale: Option<&Prenotazione>, zona: &Zona, cal: &Calendario) -> bool {
     perche_no(slot, attuale, zona, cal).is_none()
+}
+
+/// La prima data utile scritta dall'utente: "2027-01-10" (come la manda il calendario dell'app) o "10/01/2027".
+/// Vuota: nessuna.
+pub fn prima_data_utile(testo: &str) -> Result<Option<NaiveDate>, Errore> {
+    let t = testo.trim();
+    if t.is_empty() {
+        return Ok(None);
+    }
+    NaiveDate::parse_from_str(t, "%Y-%m-%d")
+        .or_else(|_| NaiveDate::parse_from_str(t, "%d/%m/%Y"))
+        .map(Some)
+        .map_err(|_| Errore::DatiNonValidi(format!("\"{t}\" non è una data: scrivila come gg/mm/aaaa")))
 }
 
 const PROVINCE: [&str; 8] = ["AL", "AT", "BI", "CN", "NO", "TO", "VB", "VC"];
@@ -273,15 +320,6 @@ impl Dove {
 
     /// "solo nel comune di Torino", "Torino e prima cintura", ...
     pub fn descrizione(&self, attuale: Option<&Prenotazione>) -> String {
-        let titolo = |s: &str| {
-            s.split(' ')
-                .map(|p| {
-                    let mut c = p.chars();
-                    c.next().map_or(String::new(), |f| f.to_uppercase().chain(c.flat_map(char::to_lowercase)).collect())
-                })
-                .collect::<Vec<_>>()
-                .join(" ")
-        };
         let o = |v: &String, da: fn(&Luogo) -> String| {
             if v.is_empty() {
                 attuale.map(|a| da(&a.luogo)).unwrap_or_default()
@@ -458,5 +496,64 @@ mod test {
         };
         assert!(!finestra.giorno_si(giorno(2026, 12, 1)) && finestra.giorno_si(giorno(2026, 12, 2)));
         assert!(finestra.giorno_si(giorno(2026, 12, 20)) && !finestra.giorno_si(giorno(2026, 12, 21)));
+    }
+
+    #[test]
+    fn date_prima_della_prima_data_utile() {
+        let att = Prenotazione {
+            quando: giorno(2027, 1, 7).and_hms_opt(11, 45, 0).unwrap(),
+            luogo: luogo("MOLINETTE", "- TORINO (TO)"),
+            cosa: "VISITA".into(),
+        };
+        let z = Zona::new(Dove::Comune(String::new()));
+        let a_torino = |d| slot(d, luogo("MAURIZIANO", "- TORINO (TO)"));
+        // dal 15 dicembre: il 14 no, il 15 si' (compreso)
+        let cal = Calendario { dal: Some(giorno(2026, 12, 15)), ..Default::default() };
+        assert_eq!(
+            perche_no(&a_torino(giorno(2026, 12, 14)), Some(&att), &z, &cal),
+            Some("prima della prima data utile")
+        );
+        assert!(candidata(&a_torino(giorno(2026, 12, 15)), Some(&att), &z, &cal));
+        assert!(!cal.giorno_si(giorno(2026, 12, 14)) && cal.giorno_si(giorno(2026, 12, 15)));
+        // dopo la prenotazione no, come sempre
+        assert_eq!(
+            perche_no(&a_torino(giorno(2027, 2, 4)), Some(&att), &z, &cal),
+            Some("non è prima della prenotazione")
+        );
+        // la prenotazione e' prima della prima data utile (l'utente non puo' andarci): da li' in poi va bene anche
+        // dopo la prenotazione, e dopo lo spostamento non si sposta piu' (niente spostamenti a catena)
+        let dopo = Calendario { dal: Some(giorno(2027, 2, 1)), ..Default::default() };
+        assert_eq!(
+            perche_no(&a_torino(giorno(2027, 1, 20)), Some(&att), &z, &dopo),
+            Some("prima della prima data utile")
+        );
+        assert!(candidata(&a_torino(giorno(2027, 2, 4)), Some(&att), &z, &dopo));
+        // senza prenotazione: ogni giorno dal giorno scelto in poi
+        let tutte = Zona::new(Dove::Tutte);
+        assert!(!candidata(&a_torino(giorno(2026, 12, 14)), None, &tutte, &cal));
+        assert!(candidata(&a_torino(giorno(2026, 12, 15)), None, &tutte, &cal));
+        // scritta dall'utente: dal calendario dell'app o a mano
+        assert_eq!(prima_data_utile("2026-12-15").unwrap(), Some(giorno(2026, 12, 15)));
+        assert_eq!(prima_data_utile(" 15/12/2026 ").unwrap(), Some(giorno(2026, 12, 15)));
+        assert_eq!(prima_data_utile("").unwrap(), None);
+        assert!(matches!(prima_data_utile("31/02/2027"), Err(Errore::DatiNonValidi(m)) if m.contains("gg/mm/aaaa")));
+        // insieme ai giorni da evitare
+        let anche_venerdi = Calendario { no_settimana: vec![4], ..cal.clone() };
+        assert_eq!(
+            perche_no(&a_torino(giorno(2026, 12, 18)), Some(&att), &z, &anche_venerdi),
+            Some("giorno da evitare")
+        );
+    }
+
+    #[test]
+    fn centro_e_nome_dei_comuni() {
+        let (lat, lon) = centro("torino").unwrap();
+        assert!((44.9..45.2).contains(&lat) && (7.5..7.8).contains(&lon));
+        assert_eq!(centro("MONDOVI'"), centro("Mondovì"));
+        assert_eq!(centro("Parigi"), None);
+        // tutti i comuni hanno il loro centro
+        assert!(COMUNI.values().all(|c| c.centro.is_some()));
+        assert_eq!(titolo("SAN MAURO TORINESE"), "San Mauro Torinese");
+        assert_eq!(titolo("MONDOVÌ"), "Mondovì");
     }
 }

@@ -680,6 +680,7 @@ mod test {
                     quando: "mar 01/12/2026 ore 09:00".into(),
                     luogo: "SAN GIOVANNI BOSCO, AMB, TORINO (TO)".into(),
                     proposta: false,
+                    comune: "TORINO".into(),
                 }],
                 date: 1,
                 ..Default::default()
@@ -693,6 +694,9 @@ mod test {
             cellulare: None,
             automatica: false,
             tentate: vec![],
+            dal: String::new(),
+            partenza: String::new(),
+            criterio: String::new(),
         }
     }
 

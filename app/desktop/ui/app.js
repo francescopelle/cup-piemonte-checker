@@ -14,6 +14,8 @@ let daEliminare = { id: null, fino: 0 };
 let daConfermare = null;
 // le operazioni partite da questa finestra, finche' il portale non risponde (contro il doppio click)
 const inViaggio = new Set();
+// le ricette con "Altre date" aperto: le schede si ridisegnano spesso, l'elenco resta aperto
+const aperte = new Set();
 const IN_CORSO = {
   controllo: "🔄 Controllo in corso… può volerci qualche minuto.",
   spostamento: "🔄 Spostamento in corso: dopo la conferma l'app controlla sul portale che sia andato. Può volerci " +
@@ -87,7 +89,9 @@ function riepilogo(r) {
   if (e.errore) return el("p", "stato errore", `⚠️ Controllo delle ${e.ora}: ${e.errore}`);
   const buone = e.buone.length;
   const offerte = e.date === 1 ? "1 data offerta" : `${e.date} date offerte`;
-  const nessuna = r.nuova ? "nessuna nella zona e nei giorni scelti." : "nessuna prima della prenotazione.";
+  // con una prima data utile vanno bene anche date dopo la prenotazione, se la prenotazione e' prima di quel giorno
+  const nessuna = r.nuova ? "nessuna nella zona e nei giorni scelti."
+    : r.dal ? "nessuna che va bene." : "nessuna prima della prenotazione.";
   return el("p", buone ? "stato buone" : "stato",
     `Controllo delle ${e.ora}: ${offerte}, ` + (buone ? (buone === 1 ? "1 va bene." : `${buone} vanno bene.`) : nessuna));
 }
@@ -115,12 +119,12 @@ function riquadroConferma(r, a) {
   if (c.tipo === "sposta") {
     box.append(el("p", "titolo", "Spostare la prenotazione?"),
       el("p", "", "Da: " + (a ? `${a.quando} · ${a.luogo}` : "la prenotazione attuale")),
-      el("p", "quando", `A: ${c.data.quando} · ${c.data.luogo}`),
+      el("p", "quando", `A: ${c.data.quando} · ${c.data.luogo}` + (c.data.distanza ? ` · ${c.data.distanza}` : "")),
       el("p", "nota", "L'app conferma sul portale e poi controlla che lo spostamento sia andato. La data attuale " +
         "viene liberata."));
   } else if (c.tipo === "prenota") {
     box.append(el("p", "titolo", "Prenotare questa data?"),
-      el("p", "quando", `${c.data.quando} · ${c.data.luogo}`));
+      el("p", "quando", `${c.data.quando} · ${c.data.luogo}` + (c.data.distanza ? ` · ${c.data.distanza}` : "")));
     if (r.esito && r.esito.cosa) box.append(el("p", "", "Per: " + r.esito.cosa));
     box.append(el("p", "nota", "L'app conferma sul portale e poi controlla che la prenotazione risulti. Dopo cerca " +
       "date prima, e se non ti va più bene puoi disdirla con \"Disdici\"."));
@@ -137,6 +141,58 @@ function riquadroConferma(r, a) {
         () => operazione(c.tipo, { id: r.id, chiave: c.data.chiave }, r.id)));
   box.append(bottoni);
   return box;
+}
+
+// una data buona: data, ora, luogo, distanza e "Sposta qui" o "Prenota qui"
+function voce(r, d, etichetta, libera) {
+  const li = el("li", "buona");
+  if (etichetta) li.append(el("span", "etichetta", etichetta));
+  li.append(el("span", "quando", d.quando + (d.proposta ? " · proposta" : "")), el("span", "dove", d.luogo));
+  if (d.distanza) li.append(el("span", "km", "📍 " + d.distanza));
+  if (libera) {
+    li.append(pulsante(r.nuova ? "Prenota qui" : "Sposta qui", "secondario", () => {
+      daConfermare = { id: r.id, tipo: r.nuova ? "prenota" : "sposta", data: d };
+      carica();
+    }));
+  }
+  return li;
+}
+
+// le date buone: in cima le due scelte, la prima data e quella nella sede piu' vicina; sotto, a richiesta, le altre
+function dateBuone(r, libera) {
+  const e = r.esito;
+  const perChiave = new Map(e.buone.map((d) => [d.chiave, d]));
+  const prima = perChiave.get(e.prima);
+  const vicina = perChiave.get(e.vicina);
+  const scelte = el("ul", "date");
+  if (prima) {
+    scelte.append(voce(r, prima, vicina === prima ? "⏱📍 La prima, ed è anche la più vicina" : "⏱ La prima", libera));
+  }
+  if (vicina && vicina !== prima) scelte.append(voce(r, vicina, "📍 La più vicina", libera));
+  const parti = [scelte];
+  parti.push(el("p", "nota", r.distanze_da
+    ? `Distanze in linea d'aria da ${r.distanze_da}.`
+    : "Per vedere anche la data nella sede più vicina scrivi in «Modifica» il comune da cui parti."));
+  const altre = e.buone.filter((d) => d !== prima && d !== vicina);
+  if (altre.length) {
+    const tutte = el("details", "tutte");
+    tutte.open = aperte.has(r.id);
+    tutte.addEventListener("toggle", () => { if (tutte.open) aperte.add(r.id); else aperte.delete(r.id); });
+    tutte.append(el("summary", "", altre.length === 1
+      ? "Un'altra data che va bene" : `Altre ${altre.length} date che vanno bene, dalla prima`));
+    const lista = el("ul", "date");
+    for (const d of altre) lista.append(voce(r, d, "", libera));
+    tutte.append(lista);
+    parti.push(tutte);
+  }
+  return parti;
+}
+
+// quale data prende la prenotazione automatica, per la scheda
+function sceltaAutomatica(r) {
+  if (r.criterio !== "distanza") return " (la prima)";
+  if (r.distanze_da) return ` (nella sede più vicina a ${r.distanze_da})`;
+  return " (la sede più vicina: scrivi in «Modifica» il comune da cui parti; finché non c'è, la prima)";
 }
 
 function scheda(r) {
@@ -161,9 +217,9 @@ function scheda(r) {
   s.append(el("p", "nota", `🔎 Cerco ${r.zona} · ${r.giorni}`));
   // in pausa o con un esito da controllare non parte niente: allora non la si mostra
   if (r.automatica && r.attiva && !r.incerta) {
-    s.append(el("p", "nota automatica", r.nuova
-      ? "⚡ Prenotazione automatica: il primo posto libero che va bene lo prenoto da sola"
-      : "⚡ Prenotazione automatica: una data prima che va bene la prenoto da sola"));
+    s.append(el("p", "nota automatica", (r.nuova
+      ? "⚡ Prenotazione automatica: un posto libero che va bene lo prenoto da sola"
+      : "⚡ Prenotazione automatica: una data che va bene la prenoto da sola") + sceltaAutomatica(r)));
   }
   s.append(riepilogo(r));
   const libera = !r.in_corso && !r.incerta && !inViaggio.has(r.id);
@@ -174,19 +230,7 @@ function scheda(r) {
     s.append(note);
   }
   if (r.esito && r.esito.buone.length && !r.in_corso) {
-    const lista = el("ul", "date");
-    for (const d of r.esito.buone) {
-      const li = el("li", "buona");
-      li.append(el("span", "quando", d.quando + (d.proposta ? " · proposta" : "")), el("span", "dove", d.luogo));
-      if (libera) {
-        li.append(pulsante(r.nuova ? "Prenota qui" : "Sposta qui", "secondario", () => {
-          daConfermare = { id: r.id, tipo: r.nuova ? "prenota" : "sposta", data: d };
-          carica();
-        }));
-      }
-      lista.append(li);
-    }
-    s.append(lista, el("p", "nota", r.nuova
+    s.append(...dateBuone(r, libera), el("p", "nota", r.nuova
       ? "Puoi prenotare qui con \"Prenota qui\", o dal sito del CUP Piemonte o al call center 800 000 500." +
         (r.automatica ? "" : " L'app non prenota mai nulla da sola.")
       : "Puoi spostarla qui con \"Sposta qui\", o dal sito del CUP Piemonte o al call center 800 000 500." +
@@ -345,8 +389,12 @@ function apri(r) {
     modulo.valore.value = valore;
     for (const c of modulo.querySelectorAll("input[name=evita]")) c.checked = r.evita.includes(Number(c.value));
     modulo.automatica.checked = automaticaPrima = r.automatica;
+    modulo.criterio.value = r.criterio;
+    modulo.dal.value = r.dal;
+    modulo.partenza.value = r.partenza;
   }
   modulo.valore.hidden = modulo.dove.value !== "altro";
+  $("criterio").hidden = !modulo.automatica.checked;
   modulo.hidden = false;
   $("nuova").hidden = true;
   modulo.nome.focus();
@@ -357,6 +405,10 @@ function chiudi() {
   $("nuova").hidden = false;
   modifica = null;
 }
+
+// la preferenza vale solo per la prenotazione automatica: senza, l'app mostra la prima data e la piu' vicina
+modulo.automatica.addEventListener("change", () => { $("criterio").hidden = !modulo.automatica.checked; });
+$("togli-dal").addEventListener("click", () => { modulo.dal.value = ""; });
 
 modulo.dove.addEventListener("change", () => {
   modulo.valore.hidden = modulo.dove.value !== "altro";
@@ -376,14 +428,16 @@ modulo.addEventListener("submit", async (ev) => {
   // controllati dall'app (formato, cellulare italiano): un errore torna come messaggio
   const contatti = { email: modulo.email.value, cellulare: modulo.cellulare.value };
   const automatica = modulo.automatica.checked;
+  // la prima data utile ("2027-01-10" dal calendario, o scritta a mano) e il comune di partenza: controllati dall'app
+  const preferenze = { criterio: modulo.criterio.value || "data", dal: modulo.dal.value, partenza: modulo.partenza.value };
   const salva = $("salva");
   salva.disabled = true;
   if (modifica === null) avvisa("Leggo la prenotazione dal portale… può volerci un minuto.", false);
   const ok = modifica === null
     ? await esegui("aggiungi", { nome: modulo.nome.value, cf: modulo.cf.value, nre: modulo.nre.value, ...comune, evita,
-                                 attiva: modulo.attiva.checked, ...contatti, automatica })
+                                 attiva: modulo.attiva.checked, ...contatti, automatica, ...preferenze })
     : await esegui("modifica", { id: modifica, nome: modulo.nome.value, ...comune, evita, ...contatti, automatica,
-                                 automaticaPrima },
+                                 automaticaPrima, ...preferenze },
                    "Modifiche salvate.");
   salva.disabled = false;
   if (ok) chiudi();
